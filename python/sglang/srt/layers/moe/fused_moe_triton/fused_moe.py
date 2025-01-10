@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
@@ -26,7 +27,6 @@ is_cuda = is_cuda_available()
 is_hip_flag = is_hip()
 if is_cuda:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
@@ -415,7 +415,7 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     if num_experts >= 224:
-        if enable_moe_align_block_size_triton or is_hip_flag:
+        if enable_moe_align_block_size_triton:
             moe_align_block_size_triton(
                 topk_ids,
                 num_experts,
