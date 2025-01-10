@@ -11,19 +11,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
-is_hip_flag = False
-if not is_hip():
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-
-    is_hip_flag = False
-else:
-    is_hip_flag = True
+is_hip_flag = is_hip()
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
@@ -412,7 +407,7 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     if num_experts >= 224:
-        if enable_moe_align_block_size_triton or is_hip_flag:
+        if enable_moe_align_block_size_triton:
             moe_align_block_size_triton(
                 topk_ids,
                 num_experts,
@@ -1011,11 +1006,22 @@ def fused_experts_impl(
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
-            torch.sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                dim=1,
-                out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
+            if topk_ids.shape[1] == 1:
+                out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(
+                    intermediate_cache3[:, 0]
+                )
+            elif topk_ids.shape[1] == 2:
+                torch.add(
+                    intermediate_cache3[:, 0],
+                    intermediate_cache3[:, 1],
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                ).squeeze(dim=1)
+            elif topk_ids.shape[1] > 2:
+                torch.sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    dim=1,
+                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
 
     return out_hidden_states
 
