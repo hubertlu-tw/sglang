@@ -65,36 +65,82 @@ using AElementOp = PassThrough;
 using BElementOp = PassThrough;
 using CDEElementOp = PassThrough;
 
-static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::MNKPadding;
-
-static constexpr ck::index_t Scale_Block_M = 1;
-
-// Template for DeviceGemmInstance with dynamic block sizes
-template <ck::index_t Scale_Block_N, ck::index_t Scale_Block_K>
-using DeviceGemmInstance = ck::tensor_operation::device::DeviceGemmMultiD_ABScale_Xdl_CShuffle_V3
-    // clang-format off
-         <Row, Col, DsLayout, ELayout,
-          A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
-          AElementOp,  BElementOp, CDEElementOp, GemmSpec,
-          256, Scale_Block_M, Scale_Block_N, Scale_Block_K,
-          128, 128, 128,
-          16, 16,
-          16, 16,
-          4,  4,
-          S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
-          S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
-          1,    2,  S<1, 32, 1, 8>,  S<8>,
-          ck::BlockGemmPipelineScheduler::Intrawave, ck::BlockGemmPipelineVersion::v1, F8>;
 
 // Now a helper function that dynamically selects the kernel based on `Scale_Block_N` and `Scale_Block_K`
-template <ck::index_t Scale_Block_N, ck::index_t Scale_Block_K>
-__forceinline__ void run_gemm_kernel(
+template <
+        int BlockSize,
+        int MPerBlock,
+        int NPerBlock,
+        int KPerBlock,
+        int MPerXDL,
+        int NPerXDL,
+        int MXdlPerWave,
+        int NXdlPerWave,
+        typename ABlockTransferThreadClusterLengths_AK0_M_AK1,
+        typename BBlockTransferThreadClusterLengths_BK0_N_BK1,
+        typename CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
+        typename CDEShuffleBlockTransferScalarPerVectors,
+        ck::BlockGemmPipelineScheduler LOOP_SCHED,
+        ck::BlockGemmPipelineVersion PIPELINE_VERSION,
+        auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::MNKPadding>
+        using DeviceGemmHelper =
+        ck::tensor_operation::device::DeviceGemmMultiD_ABScale_Xdl_CShuffle_V3<
+            Row, Col, DsLayout, ELayout,
+            A0DataType,
+            A1DataType,
+            B0DataType,
+            B1DataType,
+            DsDataType,
+            EDataType,
+            AccDataType,
+            CShuffleDataType,
+            AElementOp,
+            BElementOp,
+            CDEElementOp,
+            GemmSpec,
+            BlockSize,
+            1,
+            128,
+            128,
+            MPerBlock,
+            NPerBlock,
+            KPerBlock,
+            16,
+            16,
+            MPerXDL,
+            NPerXDL,
+            MXdlPerWave,
+            NXdlPerWave,
+            ABlockTransferThreadClusterLengths_AK0_M_AK1 ,
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            16,
+            16,
+            0,
+            BBlockTransferThreadClusterLengths_BK0_N_BK1,
+            S<1, 0, 2>,
+            S<1, 0, 2>,
+            2,
+            16,
+            16,
+            0,
+            1,
+            1,
+            CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
+            CDEShuffleBlockTransferScalarPerVectors,
+            LOOP_SCHED,
+            PIPELINE_VERSION,
+            F8>;
+
+// Wrapper function that dynamically selects gemm instances
+template <typename DeviceGemmInstance, ck::index_t SplitK=1>
+__forceinline__ torch::Tensor gemm_a8w8_subblockwise_impl(
     torch::Tensor& XQ,
     torch::Tensor& WQ,
     torch::Tensor& x_scale,
     torch::Tensor& w_scale,
-    torch::Tensor& Y
-)
+    torch::Tensor& Y)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);
@@ -104,8 +150,8 @@ __forceinline__ void run_gemm_kernel(
     int StrideB = WQ.stride(-2);
     int StrideE = N;
 
-    using DeviceGemmKernel = DeviceGemmInstance<Scale_Block_N, Scale_Block_K>;
-    auto device_gemm = DeviceGemmKernel{};
+    // TODO: fix me
+    auto device_gemm = DeviceGemmInstance{};
     auto invoker = device_gemm.MakeInvoker();
 
     auto a_element_op = AElementOp{};
@@ -133,26 +179,6 @@ __forceinline__ void run_gemm_kernel(
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
     invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
-}
-
-// Wrapper function that dynamically selects the block size
-__forceinline__ torch::Tensor gemm_a8w8_subblockwise_impl(
-    torch::Tensor& XQ,
-    torch::Tensor& WQ,
-    torch::Tensor& x_scale,
-    torch::Tensor& w_scale,
-    torch::Tensor& Y,
-    int Scale_Block_N,  // Dynamic parameter
-    int Scale_Block_K   // Dynamic parameter
-)
-{
-    if (Scale_Block_N == 128 && Scale_Block_K == 128) {
-        run_gemm_kernel<128, 128>(XQ, WQ, x_scale, w_scale, Y);
-    }
-    else {
-        TORCH_CHECK(false, "Unsupported Scale_Block_N and Scale_Block_K values.");
-    }
-
     return Y;
 }
 
