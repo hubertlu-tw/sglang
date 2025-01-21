@@ -176,11 +176,13 @@ elif is_hip():
         ck.resolve() / "include",
         root / "src" / "sgl-kernel-amd" / "csrc",
     ]
-
+    
     hipcc_flags = [
         "-D__HIP_PLATFORM_AMD__=1",
+        "-DLEGACY_HIPBLAS_DIRECT",
         "--amdgpu-target=gfx90a,gfx940,gfx941,gfx942",
     ]
+    
     ext_modules = [
         CUDAExtension(
             name="sgl_kernel.ops._kernels",
