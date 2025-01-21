@@ -59,6 +59,7 @@ ck_include_dirs = [
 
 hipcc_flags = [
     "-D__HIP_PLATFORM_AMD__=1",
+    "-DLEGACY_HIPBLAS_DIRECT",
     "--amdgpu-target=gfx90a,gfx940,gfx941,gfx942",
 ]
 
