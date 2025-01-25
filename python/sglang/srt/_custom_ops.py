@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
+# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/_custom_ops.py
 import contextlib
 import functools
 import importlib
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 if not is_hpu():
     try:
-        import sgl_kernel
+        import custom_ar
     except ImportError as e:
         logger.warning("Failed to import from custom_ar with %r", e)
 
@@ -50,41 +50,46 @@ def hint_on_error(fn):
 
 # custom ar
 def init_custom_ar(
-    rank_id: int,
-    world_size: int,
-    rank_data_base: torch.Tensor,
-    buffers: List[int],
-    tmp_result_buffers: List[int],
-    barrier_in: List[int],
-    barrier_out: List[int],
+    ipc_tensors: List[torch.Tensor],
+    rank_data: torch.Tensor,
+    rank: int,
+    full_nvlink: bool,
 ) -> int:
-    return sgl_kernel.ops.init_custom_reduce(
-        rank_id,
-        world_size,
-        rank_data_base,
-        buffers,
-        tmp_result_buffers,
-        barrier_in,
-        barrier_out,
+    return torch.ops._C_vllm_ar.init_custom_ar(
+        ipc_tensors, rank_data, rank, full_nvlink
     )
 
 
-def all_reduce(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-    sgl_kernel.ops.custom_reduce(fa, inp, out)
+def all_reduce(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_vllm_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
 def dispose(fa: int) -> None:
-    sgl_kernel.ops.custom_dispose(fa)
+    torch.ops._C_vllm_ar.dispose(fa)
+
+
+def meta_size() -> int:
+    return torch.ops._C_vllm_ar.meta_size()
+
+
+def register_buffer(fa: int, ipc_tensors: List[int]) -> None:
+    return torch.ops._C_vllm_ar.register_buffer(fa, ipc_tensors)
 
 
 def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-    return sgl_kernel.ops.get_graph_buffer_ipc_meta(fa)
+    return torch.ops._C_vllm_ar.get_graph_buffer_ipc_meta(fa)
 
 
 def register_graph_buffers(
     fa: int, handles: List[List[int]], offsets: List[List[int]]
 ) -> None:
-    sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
+    torch.ops._C_vllm_ar.register_graph_buffers(fa, handles, offsets)
 
 
 # temporary fix for https://github.com/vllm-project/vllm/issues/5456
