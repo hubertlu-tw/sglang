@@ -436,6 +436,7 @@ class FusedMoE(torch.nn.Module):
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
             # this is needed for compressed-tensors only
+            loaded_weight = loaded_weight * 2.0
             loaded_weight = loaded_weight.to(param.data.device)
 
             if (
@@ -471,8 +472,10 @@ class FusedMoE(torch.nn.Module):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
-            quant_method = getattr(param, "quant_method", None)
+            quant_method = getattr(param, "quant_method", None) 
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                scaled_factor = 0.5           #### (TODO: Hubert) Review this line for dynamic activation scheme
+                loaded_weight = loaded_weight * scaled_factor
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -492,6 +495,9 @@ class FusedMoE(torch.nn.Module):
                     tp_rank=tp_rank,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
+                scaled_factor = 2.0
+                loaded_weight = loaded_weight * scaled_factor
+
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,

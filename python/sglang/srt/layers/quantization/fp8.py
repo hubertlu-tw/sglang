@@ -444,7 +444,7 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.float8_e4m3fn
+            params_dtype = torch.int32
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -471,7 +471,7 @@ class Fp8MoEMethod:
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
+                num_experts, 2 * intermediate_size, int(hidden_size/8), dtype=params_dtype
             ),
             requires_grad=False,
         )
@@ -480,12 +480,13 @@ class Fp8MoEMethod:
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size, dtype=params_dtype
+                num_experts, hidden_size, int(intermediate_size/8), dtype=params_dtype
             ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
 
         # WEIGHT_SCALES
         if self.block_quant:
@@ -519,10 +520,21 @@ class Fp8MoEMethod:
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
+
+            w13_weight_scale1 = torch.nn.Parameter(
+                torch.ones(num_experts, 2*intermediate_size, dtype=torch.float32), requires_grad=False
+            )
+            w2_weight_scale1 = torch.nn.Parameter(
+                torch.ones(num_experts, hidden_size, dtype=torch.float32), requires_grad=False
+            )
+
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            layer.register_parameter("w13_weight_scale1", w13_weight_scale1)
+            layer.register_parameter("w2_weight_scale1", w2_weight_scale1)
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
+
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
             if self.block_quant
@@ -534,6 +546,13 @@ class Fp8MoEMethod:
         if self.quant_config.is_checkpoint_fp8_serialized:
             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+            extra_weight_attrs.update(
+                {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+            )
+
+            set_weight_attrs(w13_weight_scale1, extra_weight_attrs)
+            set_weight_attrs(w2_weight_scale1, extra_weight_attrs)
 
         # INPUT_SCALES
         if self.quant_config.activation_scheme == "static":
@@ -560,167 +579,168 @@ class Fp8MoEMethod:
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            padding_size,  # Avoid circular import
-        )
+        return 
+        #from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+        #    padding_size,  # Avoid circular import
+        #)
 
         # Block quant doesn't need to process weights after loading
-        if self.block_quant:
-            # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip():
-                # activation_scheme: dynamic
-                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.w13_weight,
-                    weight_scale=layer.w13_weight_scale_inv,
-                    input_scale=None,
-                )
-                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.w2_weight,
-                    weight_scale=layer.w2_weight_scale_inv,
-                    input_scale=None,
-                )
-                # Reset the parameter
-                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-                layer.w13_weight_scale_inv = torch.nn.Parameter(
-                    w13_weight_scale, requires_grad=False
-                )
-                layer.w13_input_scale = None
-                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-                layer.w2_weight_scale_inv = torch.nn.Parameter(
-                    w2_weight_scale, requires_grad=False
-                )
-                layer.w2_input_scale = None
-            return
-        # If checkpoint is fp16 or bfloat16, quantize in place.
-        if not self.quant_config.is_checkpoint_fp8_serialized:
-            # If ROCm, use float8_e4m3fnuz instead (MI300x HW)
-            fp8_dtype = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
-            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
-            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
+        #if self.block_quant:
+        #    # If ROCm, normalize the weights and scales to e4m3fnuz
+        #    if is_hip():
+        #        # activation_scheme: dynamic
+        #        w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+        #            weight=layer.w13_weight,
+        #            weight_scale=layer.w13_weight_scale_inv,
+        #            input_scale=None,
+        #        )
+        #        w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+        #            weight=layer.w2_weight,
+        #            weight_scale=layer.w2_weight_scale_inv,
+        #            input_scale=None,
+        #        )
+        #        # Reset the parameter
+        #        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+        #        layer.w13_weight_scale_inv = torch.nn.Parameter(
+        #            w13_weight_scale, requires_grad=False
+        #        )
+        #        layer.w13_input_scale = None
+        #        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        #        layer.w2_weight_scale_inv = torch.nn.Parameter(
+        #            w2_weight_scale, requires_grad=False
+        #        )
+        #        layer.w2_input_scale = None
+        #    return
+        ## If checkpoint is fp16 or bfloat16, quantize in place.
+        #if not self.quant_config.is_checkpoint_fp8_serialized:
+        #    # If ROCm, use float8_e4m3fnuz instead (MI300x HW)
+        #    fp8_dtype = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+        #    w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
+        #    w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
-            # Re-initialize w13_scale because we directly quantize
-            # merged w13 weights and generate a single scaling factor.
-            layer.w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    layer.num_experts, dtype=torch.float32, device=w13_weight.device
-                ),
-                requires_grad=False,
-            )
-            for expert in range(layer.num_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        #    # Re-initialize w13_scale because we directly quantize
+        #    # merged w13 weights and generate a single scaling factor.
+        #    layer.w13_weight_scale = torch.nn.Parameter(
+        #        torch.ones(
+        #            layer.num_experts, dtype=torch.float32, device=w13_weight.device
+        #        ),
+        #        requires_grad=False,
+        #    )
+        #    for expert in range(layer.num_experts):
+        #        w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+        #            ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+        #        )
+        #        w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+        #            ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+        #        )
+        #    layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+        #    layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-            # If ROCm, apply weight padding (min. Mem channel contention) only if set
-            if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
-                layer.w13_weight = torch.nn.Parameter(
-                    F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-                layer.w2_weight = torch.nn.Parameter(
-                    F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-            return
+        #    # If ROCm, apply weight padding (min. Mem channel contention) only if set
+        #    if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
+        #        layer.w13_weight = torch.nn.Parameter(
+        #            F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
+        #            requires_grad=False,
+        #        )
+        #        torch.cuda.empty_cache()
+        #        layer.w2_weight = torch.nn.Parameter(
+        #            F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
+        #            requires_grad=False,
+        #        )
+        #        torch.cuda.empty_cache()
+        #    return
 
-        # If checkpoint is fp8, we need to handle that the
-        # MoE kernels require single activation scale and single weight
-        # scale for w13 per expert.
-        else:
-            # Fp8 moe kernels require a single activation scale.
-            # We take the max of all the scales in case they differ.
-            if self.quant_config.activation_scheme == "static":
-                if layer.w13_input_scale is None or layer.w2_input_scale is None:
-                    raise ValueError(
-                        "QuantConfig has static quantization, but found "
-                        "activation scales are None."
-                    )
-                if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
-                    layer.w2_input_scale
-                ):
-                    print_warning_once(
-                        "Found input_scales that are not equal for "
-                        "fp8 MoE layer. Using the maximum across experts "
-                        "for each layer. "
-                    )
-                layer.w13_input_scale = torch.nn.Parameter(
-                    layer.w13_input_scale.max(), requires_grad=False
-                )
-                layer.w2_input_scale = torch.nn.Parameter(
-                    layer.w2_input_scale.max(), requires_grad=False
-                )
+        ## If checkpoint is fp8, we need to handle that the
+        ## MoE kernels require single activation scale and single weight
+        ## scale for w13 per expert.
+        #else:
+        #    # Fp8 moe kernels require a single activation scale.
+        #    # We take the max of all the scales in case they differ.
+        #    if self.quant_config.activation_scheme == "static":
+        #        if layer.w13_input_scale is None or layer.w2_input_scale is None:
+        #            raise ValueError(
+        #                "QuantConfig has static quantization, but found "
+        #                "activation scales are None."
+        #            )
+        #        if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
+        #            layer.w2_input_scale
+        #        ):
+        #            print_warning_once(
+        #                "Found input_scales that are not equal for "
+        #                "fp8 MoE layer. Using the maximum across experts "
+        #                "for each layer. "
+        #            )
+        #        layer.w13_input_scale = torch.nn.Parameter(
+        #            layer.w13_input_scale.max(), requires_grad=False
+        #        )
+        #        layer.w2_input_scale = torch.nn.Parameter(
+        #            layer.w2_input_scale.max(), requires_grad=False
+        #        )
 
-            # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip():
-                # Normalize the weights and scales
-                w13_weight, w13_weight_scale, w13_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
-                    )
-                )
-                w2_weight, w2_weight_scale, w2_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
-                    )
-                )
-                # Reset the parameter
-                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-                layer.w13_weight_scale = torch.nn.Parameter(
-                    w13_weight_scale, requires_grad=False
-                )
-                if w13_input_scale is not None:
-                    layer.w13_input_scale = torch.nn.Parameter(
-                        w13_input_scale, requires_grad=False
-                    )
-                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-                layer.w2_weight_scale = torch.nn.Parameter(
-                    w2_weight_scale, requires_grad=False
-                )
-                if w2_input_scale is not None:
-                    layer.w2_input_scale = torch.nn.Parameter(
-                        w2_input_scale, requires_grad=False
-                    )
-            # Fp8 moe kernel needs single weight scale for w13 per expert.
-            # We take the max then dequant and requant each expert.
-            assert layer.w13_weight_scale is not None
-            shard_size = layer.intermediate_size_per_partition
-            max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.num_experts):
-                start = 0
-                for shard_id in range(2):
-                    dq_weight = per_tensor_dequantize(
-                        layer.w13_weight[expert_id][start : start + shard_size, :],
-                        layer.w13_weight_scale[expert_id][shard_id],
-                    )
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    )
-                    start += shard_size
+        #    # If ROCm, normalize the weights and scales to e4m3fnuz
+        #    if is_hip():
+        #        # Normalize the weights and scales
+        #        w13_weight, w13_weight_scale, w13_input_scale = (
+        #            normalize_e4m3fn_to_e4m3fnuz(
+        #                layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
+        #            )
+        #        )
+        #        w2_weight, w2_weight_scale, w2_input_scale = (
+        #            normalize_e4m3fn_to_e4m3fnuz(
+        #                layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
+        #            )
+        #        )
+        #        # Reset the parameter
+        #        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+        #        layer.w13_weight_scale = torch.nn.Parameter(
+        #            w13_weight_scale, requires_grad=False
+        #        )
+        #        if w13_input_scale is not None:
+        #            layer.w13_input_scale = torch.nn.Parameter(
+        #                w13_input_scale, requires_grad=False
+        #            )
+        #        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        #        layer.w2_weight_scale = torch.nn.Parameter(
+        #            w2_weight_scale, requires_grad=False
+        #        )
+        #        if w2_input_scale is not None:
+        #            layer.w2_input_scale = torch.nn.Parameter(
+        #                w2_input_scale, requires_grad=False
+        #            )
+        #    # Fp8 moe kernel needs single weight scale for w13 per expert.
+        #    # We take the max then dequant and requant each expert.
+        #    assert layer.w13_weight_scale is not None
+        #    shard_size = layer.intermediate_size_per_partition
+        #    max_w13_scales = layer.w13_weight_scale.max(dim=1).values
+        #    for expert_id in range(layer.num_experts):
+        #        start = 0
+        #        for shard_id in range(2):
+        #            dq_weight = per_tensor_dequantize(
+        #                layer.w13_weight[expert_id][start : start + shard_size, :],
+        #                layer.w13_weight_scale[expert_id][shard_id],
+        #            )
+        #            layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
+        #                ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+        #            )
+        #            start += shard_size
 
-            layer.w13_weight_scale = torch.nn.Parameter(
-                max_w13_scales, requires_grad=False
-            )
+        #    layer.w13_weight_scale = torch.nn.Parameter(
+        #        max_w13_scales, requires_grad=False
+        #    )
 
-            # If ROCm, apply weight padding (min. Mem channel contention) only if set
-            if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
-                layer.w13_weight = torch.nn.Parameter(
-                    F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-                layer.w2_weight = torch.nn.Parameter(
-                    F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-            return
+        #    # If ROCm, apply weight padding (min. Mem channel contention) only if set
+        #    if is_hip() and bool(int(os.getenv("MOE_PADDING", "0"))):
+        #        layer.w13_weight = torch.nn.Parameter(
+        #            F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
+        #            requires_grad=False,
+        #        )
+        #        torch.cuda.empty_cache()
+        #        layer.w2_weight = torch.nn.Parameter(
+        #            F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
+        #            requires_grad=False,
+        #        )
+        #        torch.cuda.empty_cache()
+        #    return
 
     def apply(
         self,
@@ -772,6 +792,8 @@ class Fp8MoEMethod:
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
+            w1_scale1=layer.w13_weight_scale1,
+            w2_scale1=layer.w2_weight_scale1,
         )
 
 

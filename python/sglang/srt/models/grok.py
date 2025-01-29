@@ -236,7 +236,7 @@ class Grok1DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.num_experts = config.num_local_experts
+        self.num_experts = config.num_experts
         self.hidden_size = config.hidden_size
 
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -252,7 +252,7 @@ class Grok1DecoderLayer(nn.Module):
         )
         self.block_sparse_moe = Grok1MoE(
             config=config,
-            num_experts=config.num_local_experts,
+            num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=getattr(
@@ -353,7 +353,7 @@ class Grok1ForCausalLM(nn.Module):
 
         # Monkey patch _prepare_weights to load pre-sharded weights
         if (
-            self.config.num_local_experts > 0
+            self.config.num_experts > 0
             and get_tensor_model_parallel_world_size() > 1
         ):
             self.use_presharded_weights = True
@@ -376,11 +376,11 @@ class Grok1ForCausalLM(nn.Module):
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
-        use_presharded_weights: bool | None = None,
+        use_presharded_weights: Optional[bool] = None,
     ):
         if use_presharded_weights is None:
             use_presharded_weights = self.use_presharded_weights
-        num_experts = self.config.num_local_experts
+        num_experts = self.config.num_experts
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
