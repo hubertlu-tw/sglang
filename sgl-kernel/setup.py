@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import glob
 
 root = Path(__file__).parent.resolve()
 
@@ -157,6 +158,7 @@ if is_cuda():
         cmdclass={"build_ext": BuildExtension},
     )
 elif is_hip():
+    cutlass = root / "3rdparty" / "cutlass"
     flashinfer = root / "3rdparty" / "flashinfer"
     turbomind = root / "3rdparty" / "turbomind"
     include_dirs = [
@@ -208,7 +210,7 @@ elif is_hip():
 
     setup(
         name="sgl-kernel",
-        version=get_version(),
+        version=_get_version(),
         packages=["sgl_kernel", "sgl_kernel.ops", "sgl_kernel.csrc"],
         package_dir={"sgl_kernel": "src/sgl-kernel-amd"},
         ext_modules=ext_modules,
