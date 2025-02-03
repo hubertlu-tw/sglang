@@ -17,7 +17,10 @@ if TYPE_CHECKING:
 class WaveAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.wave_ops.decode_attention import (
+        #from sglang.srt.layers.attention.wave_ops.decode_attention import (
+        #    decode_attention_fwd,
+        #)
+        from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.wave_ops.extend_attention import (
@@ -207,7 +210,7 @@ class WaveAttnBackend(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             attn_logits,
-            attn_logits_max,
+            #attn_logits_max,   # wave-attn only
             self.num_kv_splits,
             layer.scaling,
             layer.logit_cap,
