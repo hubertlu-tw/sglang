@@ -56,10 +56,22 @@ def extend_attention_wave(
     is_causal=True,
 ):
 
-    if is_causal:
-        raise NotImplementedError(
-            "non causal mask not supported yet on extend_attention wave backend."
-        )
+    #if is_causal:
+    #    raise NotImplementedError(
+    #        "non causal mask not supported yet on extend_attention wave backend."
+    #    )
+    arguments = [
+            ("q_extend", q_extend),
+            ("k_extend", k_extend),
+            ("v_extend", v_extend),
+            ("output", output),
+        ]
+    print("------- Before extend_attention_fwd arguments:")
+    for name, arg in arguments:
+        if hasattr(arg, "shape"):
+            print(f"Argument {name}: shape = {arg.shape}")
+        else:
+            print(f"Argument {name}: value = {arg}")
 
     shape = AttentionShape(
         num_query_heads=q_extend.shape[1],
@@ -72,6 +84,9 @@ def extend_attention_wave(
     )
 
     assert shape.num_query_heads % shape.num_kv_heads == 0
+    # Transose the V tensor.
+    v_extend_t = v_extend.permute(1, 2, 0)
+    v_buffer_t = v_buffer.permute(1, 2, 0)
 
     # Run the wave kernel.
     mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
@@ -83,10 +98,12 @@ def extend_attention_wave(
         mfma_variant,
         q_extend.shape,
         k_extend.shape,
-        v_extend.shape,
+        # v_extend.shape,
+        v_extend_t.shape,
         req_to_tokens.shape,
         k_buffer.shape,
-        v_buffer.shape,
+        # v_buffer.shape,
+        v_buffer_t.shape,
         output.shape,
         input_dtype=q_extend.dtype,
         output_dtype=output.dtype,
@@ -112,14 +129,16 @@ def extend_attention_wave(
         mb = extend_attention(
             q_extend * dk_sqrt * log2e,
             k_extend,
-            v_extend,
+            # v_extend,
+            v_extend_t,
             k_buffer,
-            v_buffer,
-            req_to_tokens,
-            b_req_idx,
-            b_seq_len,
-            b_seq_len_extend,
-            b_start_loc_extend,
+            # v_buffer,
+            v_buffer_t,
+            req_to_tokens.to(torch.int64),
+            b_req_idx.to(torch.int64),
+            b_seq_len.to(torch.int64),
+            b_seq_len_extend.to(torch.int64),
+            b_start_loc_extend.to(torch.int64),
             output,
         )
 
@@ -134,3 +153,9 @@ def extend_attention_wave(
             filename = f"wave_prefill_attention_{'x'.join(map(str, shape_list))}.mlir"
             with open(filename, "w") as f:
                 f.write(mb.module_op.get_asm())
+    print("------- After extend_attention_fwd arguments:")
+    for name, arg in arguments:
+        if hasattr(arg, "shape"):
+            print(f"Argument {name}: shape = {arg.shape}")
+        else:
+            print(f"Argument {name}: value = {arg}")
