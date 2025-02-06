@@ -54,6 +54,7 @@ def extend_attention_wave(
     max_seq_len,
     output,
     is_causal=True, # TODO: check this
+    logit_cap = 0.  # TODO: check this
     # is_causal=False,
 ):
     arguments = [
@@ -98,6 +99,7 @@ def extend_attention_wave(
         output_dtype=output.dtype,
         size_dtype=b_seq_len.dtype,
         is_causal=is_causal,
+        logit_cap=logit_cap,
     )
 
     hyperparams.update(get_default_scheduling_params())

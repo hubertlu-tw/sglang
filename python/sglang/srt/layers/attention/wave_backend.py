@@ -163,7 +163,7 @@ class WaveAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             # TODO: Add additional parameters for logit_cap and scaling.
             # layer.scaling,
-            # layer.logit_cap,
+            logit_cap=layer.logit_cap,
         )
         return o
     def forward_decode(
