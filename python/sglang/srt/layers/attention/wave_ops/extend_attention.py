@@ -53,25 +53,18 @@ def extend_attention_wave(
     b_start_loc_extend,
     max_seq_len,
     output,
-    is_causal=True,
+    is_causal=True, # TODO: check this
+    # is_causal=False,
 ):
-
-    #if is_causal:
-    #    raise NotImplementedError(
-    #        "non causal mask not supported yet on extend_attention wave backend."
-    #    )
     arguments = [
             ("q_extend", q_extend),
             ("k_extend", k_extend),
             ("v_extend", v_extend),
             ("output", output),
+            ("req_to_tokens", req_to_tokens),
+            ("k_buffer", k_buffer),
+            ("v_buffer", v_buffer),
         ]
-    print("------- Before extend_attention_fwd arguments:")
-    for name, arg in arguments:
-        if hasattr(arg, "shape"):
-            print(f"Argument {name}: shape = {arg.shape}")
-        else:
-            print(f"Argument {name}: value = {arg}")
 
     shape = AttentionShape(
         num_query_heads=q_extend.shape[1],
@@ -84,30 +77,27 @@ def extend_attention_wave(
     )
 
     assert shape.num_query_heads % shape.num_kv_heads == 0
-    # Transose the V tensor.
-    v_extend_t = v_extend.permute(1, 2, 0)
-    v_buffer_t = v_buffer.permute(1, 2, 0)
-
     # Run the wave kernel.
     mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
     (
         extend_attention,
         hyperparams,
+        dynamic_symbols,
+        dynamic_symbols_map,
     ) = get_extend_attention_kernel(
         shape,
         mfma_variant,
         q_extend.shape,
         k_extend.shape,
-        # v_extend.shape,
-        v_extend_t.shape,
+        v_extend.shape,
         req_to_tokens.shape,
         k_buffer.shape,
-        # v_buffer.shape,
-        v_buffer_t.shape,
+        v_buffer.shape,
         output.shape,
         input_dtype=q_extend.dtype,
         output_dtype=output.dtype,
         size_dtype=b_seq_len.dtype,
+        is_causal=is_causal,
     )
 
     hyperparams.update(get_default_scheduling_params())
@@ -115,7 +105,6 @@ def extend_attention_wave(
 
     log2e = 1.44269504089
     dk_sqrt = math.sqrt(1.0 / shape.head_size)
-
     with tk.gen.TestLaunchContext(
         hyperparams,
         canonicalize=True,
@@ -123,22 +112,21 @@ def extend_attention_wave(
         run_bench=False,
         run_config=config,
         schedule=False,
-        use_scheduling_barriers=False,
+        dynamic_symbols=dynamic_symbols,
+        dynamic_symbols_map=dynamic_symbols_map,
     ):
         # TODO: Add scaling of QK as part of kernel.
         mb = extend_attention(
             q_extend * dk_sqrt * log2e,
             k_extend,
-            # v_extend,
-            v_extend_t,
+            v_extend,
             k_buffer,
-            # v_buffer,
-            v_buffer_t,
-            req_to_tokens.to(torch.int64),
-            b_req_idx.to(torch.int64),
-            b_seq_len.to(torch.int64),
-            b_seq_len_extend.to(torch.int64),
-            b_start_loc_extend.to(torch.int64),
+            v_buffer,
+            req_to_tokens,
+            b_req_idx,
+            b_seq_len,
+            b_seq_len_extend,
+            b_start_loc_extend,
             output,
         )
 
@@ -153,9 +141,3 @@ def extend_attention_wave(
             filename = f"wave_prefill_attention_{'x'.join(map(str, shape_list))}.mlir"
             with open(filename, "w") as f:
                 f.write(mb.module_op.get_asm())
-    print("------- After extend_attention_fwd arguments:")
-    for name, arg in arguments:
-        if hasattr(arg, "shape"):
-            print(f"Argument {name}: shape = {arg.shape}")
-        else:
-            print(f"Argument {name}: value = {arg}")

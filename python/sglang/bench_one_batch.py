@@ -73,7 +73,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 
-
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
@@ -125,7 +124,7 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, tp_rank):
-    #suppress_other_loggers() ### For debug
+    suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     model_config = ModelConfig(

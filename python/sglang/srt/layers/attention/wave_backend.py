@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import logging
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -17,25 +18,15 @@ if TYPE_CHECKING:
 class WaveAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
-        #from sglang.srt.layers.attention.wave_ops.decode_attention import (
-        #    decode_attention_fwd,
-        #)
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.wave_ops.extend_attention import (
             extend_attention_wave,
         )
-        # from sglang.srt.layers.attention.triton_ops.extend_attention import (
-        #     extend_attention_fwd,
-        # )
-        # TODO: Add support for extend attention
-
         super().__init__()
-        print("========== Beginning of WaveAttnBackend  __init__ ============")
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_wave  # Wave
-        # self.extend_attention_fwd = extend_attention_fwd # triton
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -49,7 +40,6 @@ class WaveAttnBackend(AttentionBackend):
         self.cuda_graph_max_seq_len = model_runner.model_config.context_len
 
         self.device = model_runner.device
-        print("========== End of WaveAttnBackend  __init__ ============")
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for wave attention backend."""
@@ -153,47 +143,11 @@ class WaveAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        print("======= Before save_kv_cache =========")
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-        print("======= After save_kv_cache =========")
         _, max_extend_len = self.forward_metadata
-        # --- Added Printing Code Start ---
-        # Prepare the arguments along with their names as they will be passed to extend_attention_fwd
-        arguments = [
-            ("q_view", q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)),
-            ("k_contiguous", k.contiguous()),
-            ("v_contiguous", v.contiguous()),
-            (
-                "key_buffer",
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            ),
-            (
-                "value_buffer",
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            ),
-            ("req_to_token", forward_batch.req_to_token_pool.req_to_token),
-            ("req_pool_indices", forward_batch.req_pool_indices),
-            ("seq_lens", forward_batch.seq_lens),
-            ("extend_seq_lens", forward_batch.extend_seq_lens),
-            ("extend_start_loc", forward_batch.extend_start_loc),
-            ("max_extend_len", max_extend_len),
-            (
-                "output_view",
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            ),
-        ]
-
-        print("extend_attention_fwd arguments:")
-        for name, arg in arguments:
-            if hasattr(arg, "shape"):
-                print(f"Argument {name}: shape = {arg.shape}")
-            else:
-                print(f"Argument {name}: value = {arg}")
-        # --- Added Printing Code End ---
-
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -212,81 +166,6 @@ class WaveAttnBackend(AttentionBackend):
             # layer.logit_cap,
         )
         return o
-    """
-    ############ TODO: remove this forward_extend as this is for triton forward_extend ########
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache=True,
-    ):
-        # TODO: reuse the buffer across layers
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
-
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
-
-        _, max_extend_len = self.forward_metadata
-        # --- Added Printing Code Start ---
-        # Prepare the arguments along with their names as they will be passed to extend_attention_fwd
-        arguments = [
-            ("q_view", q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)),
-            ("k_contiguous", k.contiguous()),
-            ("v_contiguous", v.contiguous()),
-            (
-                "key_buffer",
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            ),
-            (
-                "value_buffer",
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            ),
-            ("req_to_token", forward_batch.req_to_token_pool.req_to_token),
-            ("req_pool_indices", forward_batch.req_pool_indices),
-            ("seq_lens", forward_batch.seq_lens),
-            ("extend_seq_lens", forward_batch.extend_seq_lens),
-            ("extend_start_loc", forward_batch.extend_start_loc),
-            ("max_extend_len", max_extend_len),
-            (
-                "output_view",
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            ),
-        ]
-
-        print("extend_attention_fwd arguments:")
-        for name, arg in arguments:
-            if hasattr(arg, "shape"):
-                print(f"Argument {name}: shape = {arg.shape}")
-            else:
-                print(f"Argument {name}: value = {arg}")
-        # --- Added Printing Code End ---
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
-            max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
-        )
-        return o
-
-    """
     def forward_decode(
         self,
         q: torch.Tensor,
