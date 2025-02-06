@@ -1,29 +1,46 @@
-# Llama 3.1
-# MODELS=(
-#     "amd/Meta-Llama-3.1-8B-Instruct-FP8-KV"
-# )
+#!/bin/bash
 
-# MODELS_PATH=(
-#     "/data/llama3.1/Llama-3.1-8B-Instruct-FP8-KV/"
-# )
+# ============================================
+# LLaMA 3.1 Benchmarking
+# ============================================
 
+# Model configurations
+# LLAMA_MODEL="amd/Meta-Llama-3.1-8B-Instruct-FP8-KV"
+# LLAMA_MODEL_PATH="/data/llama3.1/Llama-3.1-8B-Instruct-FP8-KV/"
+
+# Run benchmarking for LLaMA 3.1
 # rocprofv3 --hip-runtime-trace --kernel-trace --output-format pftrace -- python3 -m sglang.bench_one_batch \
 # python3 -m sglang.bench_one_batch \
 #     --batch-size 32 \
 #     --input 32 \
 #     --output 32 \
-#     --model-path "$MODELS_PATH" \
+#     --model-path "$LLAMA_MODEL_PATH" \
 #     --quantization fp8 \
 #     --attention-backend wave \
 #     --disable-cuda-graph \
-#     --tp 8 2>&1 | tee llama3.1-8B_tp1wave_log.txt
+#     --tp 8 2>&1 | tee "llama3.1-8B_tp8_wave_$(date +'%Y%m%d_%H%M%S').txt"
 
+# ============================================
+# Grok Benchmarking
+# ============================================
 
+# Remove existing wave cache
 rm -r ~/.wave/
-# python3 -m sglang.bench_one_batch --model dummy_grok1/ --load-format dummy --tokenizer-path Xenova/grok-1-tokenizer --tp 8 --batch-size 32 --input 1024 --output 128 --quantization fp8 --attention-backend wave --enable-nan-detection 2>&1 | tee wave_log.txt
-#python -m sglang.bench_one_batch --batch-size 1 --input 2048 --output 256 --model /data//lmzheng-grok-1/ --tp 8 --trust-remote-code --quantization fp8 --correctness-test --attention-backend wave 2>&1 | tee wave_log.txt
 
-#WAVE_CACHE_ON=0 
-python -m sglang.bench_one_batch  --batch-size 32 --input 128 --output 128 --model /data/lmzheng-grok-1/ --tokenizer-path Xenova/grok-1-tokenizer --tp 8 --trust-remote-code --quantization fp8 --attention-backend wave --correctness-test --enable-nan-detection 2>&1 | tee log.txt
+# Model configurations
+GROK_MODEL_PATH="/data/lmzheng-grok-1/"
+TOKENIZER_PATH="Xenova/grok-1-tokenizer"
 
-#python -m sglang.bench_one_batch  --model dummy_grok1/ --load-format dummy --tokenizer-path Xenova/grok-1-tokenizer --tp 8 --batch-size 32 --input 1024 --output 128 --quantization fp8 --attention-backend wave --enable-nan-detection --correctness-test 2>&1 | tee wave_log.txt
+# Run benchmarking for Grok 
+# Accuracy: add --correctness-test \
+python -m sglang.bench_one_batch  \
+    --batch-size 32 \
+    --input 128 \
+    --output 128 \
+    --model "$GROK_MODEL_PATH" \
+    --tokenizer-path "$TOKENIZER_PATH" \
+    --tp 8 \
+    --trust-remote-code \
+    --quantization fp8 \
+    --attention-backend wave \
+    --enable-nan-detection 2>&1 | tee "grok_log_$(date +'%Y%m%d_%H%M%S').txt"
