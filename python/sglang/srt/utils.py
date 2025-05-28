@@ -93,7 +93,6 @@ HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 _warned_bool_env_var_keys = set()
 
-
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     value = value.lower()
@@ -2024,14 +2023,23 @@ class DeepEPMode(Enum):
         else:
             return DeepEPMode.normal
 
-
+_is_hip = is_hip()
 def fast_topk(values, topk, dim):
+    import torch
     if topk == 1:
         # Use max along the specified dimension to get both value and index
         return torch.max(values, dim=dim, keepdim=True)
     else:
         # Use topk for efficiency with larger k values
-        return torch.topk(values, topk, dim=dim)
+        # return torch.topk(values, topk, dim=dim)
+        if _is_hip and values.dim() == 2 and values.dtype == torch.float32:
+            # from sglang.srt.speculative.topk import topk as triton_topk
+            from aiter.ops.triton.topk import topk as triton_topk
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            return triton_topk(values, topk, dim=dim, largest=True, sorted=True)
+        else:
+            return torch.topk(values, topk, dim=dim)
 
 
 def _check(cc_major):
