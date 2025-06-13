@@ -55,13 +55,10 @@ have_hip_runtime = torch.version.hip is not None
 have_gpu = have_hip_runtime and torch.cuda.is_available()
 
 
-
 amdgpu_target = None
 if have_gpu:
     try:
-        amdgpu_target = (
-            torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-        )
+        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         if amdgpu_target not in supported_arches:
             print(
                 f"[setup_rocm] Unsupported AMD GPU '{amdgpu_target}'. "
@@ -70,16 +67,21 @@ if have_gpu:
             )
             have_gpu = False
     except (AssertionError, RuntimeError, AttributeError) as exc:
-        print(f"[setup_rocm] Could not query GPU properties ({exc}). "
-              "Skipping ROCm extension build.")
+        print(
+            f"[setup_rocm] Could not query GPU properties ({exc}). "
+            "Skipping ROCm extension build."
+        )
         have_gpu = False
 else:
     if not have_hip_runtime:
-        print("[setup_rocm] CPU-only PyTorch build detected. "
-              "Skipping ROCm extension build.")
+        print(
+            "[setup_rocm] CPU-only PyTorch build detected. "
+            "Skipping ROCm extension build."
+        )
     else:
-        print("[setup_rocm] No GPU visible to PyTorch. "
-              "Skipping ROCm extension build.")
+        print(
+            "[setup_rocm] No GPU visible to PyTorch. " "Skipping ROCm extension build."
+        )
 
 if have_gpu:
     hipcc_flags = [
