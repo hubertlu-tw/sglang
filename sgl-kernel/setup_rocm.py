@@ -50,47 +50,72 @@ cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-amdgpu_target = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-if amdgpu_target not in ["gfx942", "gfx950"]:
-    print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+supported_arches = {"gfx942", "gfx950"}
+have_hip_runtime = torch.version.hip is not None
+have_gpu = have_hip_runtime and torch.cuda.is_available()
+
+
+
+amdgpu_target = None
+if have_gpu:
+    try:
+        amdgpu_target = (
+            torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        )
+        if amdgpu_target not in supported_arches:
+            print(
+                f"[setup_rocm] Unsupported AMD GPU '{amdgpu_target}'. "
+                f"Supported: {', '.join(sorted(supported_arches))}. "
+                "Skipping ROCm extension build."
+            )
+            have_gpu = False
+    except (AssertionError, RuntimeError, AttributeError) as exc:
+        print(f"[setup_rocm] Could not query GPU properties ({exc}). "
+              "Skipping ROCm extension build.")
+        have_gpu = False
+else:
+    if not have_hip_runtime:
+        print("[setup_rocm] CPU-only PyTorch build detected. "
+              "Skipping ROCm extension build.")
+    else:
+        print("[setup_rocm] No GPU visible to PyTorch. "
+              "Skipping ROCm extension build.")
+
+if have_gpu:
+    hipcc_flags = [
+        "-DNDEBUG",
+        f"-DOPERATOR_NAMESPACE={operator_namespace}",
+        "-O3",
+        "-Xcompiler",
+        "-fPIC",
+        "-std=c++17",
+        "-D__HIP_PLATFORM_AMD__=1",
+        f"--amdgpu-target={amdgpu_target}",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+    ]
+
+    ext_modules = [
+        CUDAExtension(
+            name="sgl_kernel.common_ops",
+            sources=sources,
+            include_dirs=include_dirs,
+            extra_compile_args={
+                "nvcc": hipcc_flags,
+                "cxx": cxx_flags,
+            },
+            libraries=libraries,
+            extra_link_args=extra_link_args,
+            py_limited_api=False,
+        ),
+    ]
+
+    setup(
+        name="sgl-kernel",
+        version=_get_version(),
+        packages=find_packages(where="python"),
+        package_dir={"": "python"},
+        ext_modules=ext_modules,
+        cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+        options={"bdist_wheel": {"py_limited_api": "cp39"}},
     )
-    sys.exit(1)
-
-hipcc_flags = [
-    "-DNDEBUG",
-    f"-DOPERATOR_NAMESPACE={operator_namespace}",
-    "-O3",
-    "-Xcompiler",
-    "-fPIC",
-    "-std=c++17",
-    "-D__HIP_PLATFORM_AMD__=1",
-    f"--amdgpu-target={amdgpu_target}",
-    "-DENABLE_BF16",
-    "-DENABLE_FP8",
-]
-
-ext_modules = [
-    CUDAExtension(
-        name="sgl_kernel.common_ops",
-        sources=sources,
-        include_dirs=include_dirs,
-        extra_compile_args={
-            "nvcc": hipcc_flags,
-            "cxx": cxx_flags,
-        },
-        libraries=libraries,
-        extra_link_args=extra_link_args,
-        py_limited_api=False,
-    ),
-]
-
-setup(
-    name="sgl-kernel",
-    version=_get_version(),
-    packages=find_packages(where="python"),
-    package_dir={"": "python"},
-    ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
-)
