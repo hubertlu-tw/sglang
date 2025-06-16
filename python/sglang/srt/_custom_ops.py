@@ -68,51 +68,108 @@ if not is_hip():
 
 else:
     # ROCM custom allreduce
+    if get_bool_env_var("USE_AITER_CAR"):
+        import aiter.ops.custom_all_reduce as aiter_custom_ar
 
-    def init_custom_ar(
-        meta: torch.Tensor,
-        rank_data: torch.Tensor,
-        handles: List[str],
-        offsets: List[int],
-        rank: int,
-        full_nvlink: bool,
-    ) -> int:
-        return sgl_kernel.allreduce.init_custom_ar(
-            meta, rank_data, handles, offsets, rank, full_nvlink
-        )
+        def init_custom_ar(
+            meta: torch.Tensor,
+            rank_data: torch.Tensor,
+            handles: List[str],
+            offsets: List[int],
+            rank: int,
+            full_nvlink: bool,
+        ) -> int:
+            return aiter_custom_ar.init_custom_ar(
+                meta, rank_data, handles, offsets, rank, full_nvlink
+            )
 
-    def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-        sgl_kernel.allreduce.all_reduce_reg(fa, inp, out)
+        def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
+            if get_bool_env_var("USE_AITER_CAR_FP8"):
+                aiter_custom_ar.all_reduce_reg(fa, inp, out, open_fp8_quant=True)
+            else:
+                aiter_custom_ar.all_reduce_reg(fa, inp, out)
 
-    def all_reduce_unreg(
-        fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
-    ) -> None:
-        sgl_kernel.allreduce.all_reduce_unreg(fa, inp, reg_buffer, out)
+        def all_reduce_unreg(
+            fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+        ) -> None:
+            if get_bool_env_var("USE_AITER_CAR_FP8"):
+                aiter_custom_ar.all_reduce_unreg(
+                    fa, inp, reg_buffer, out, open_fp8_quant=True
+                )
+            else:
+                aiter_custom_ar.all_reduce_unreg(fa, inp, reg_buffer, out)
 
-    def dispose(fa: int) -> None:
-        sgl_kernel.allreduce.dispose(fa)
+        def dispose(fa: int) -> None:
+            aiter_custom_ar.dispose(fa)
 
-    def meta_size() -> int:
-        return sgl_kernel.allreduce.meta_size()
+        def meta_size() -> int:
+            return aiter_custom_ar.meta_size()
 
-    def register_buffer(
-        fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
-    ) -> None:
-        return sgl_kernel.allreduce.register_buffer(fa, t, handles, offsets)
+        def register_buffer(
+            fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
+        ) -> None:
+            return aiter_custom_ar.register_buffer(fa, t, handles, offsets)
 
-    def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
-        return sgl_kernel.allreduce.get_graph_buffer_ipc_meta(fa)
+        def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
+            return aiter_custom_ar.get_graph_buffer_ipc_meta(fa)
 
-    def register_graph_buffers(
-        fa: int, handles: List[str], offsets: List[List[int]]
-    ) -> None:
-        sgl_kernel.allreduce.register_graph_buffers(fa, handles, offsets)
+        def register_graph_buffers(
+            fa: int, handles: List[str], offsets: List[List[int]]
+        ) -> None:
+            aiter_custom_ar.register_graph_buffers(fa, handles, offsets)
 
-    def allocate_meta_buffer(size: int) -> torch.Tensor:
-        return sgl_kernel.allreduce.allocate_meta_buffer(size)
+        def allocate_meta_buffer(size: int) -> torch.Tensor:
+            return aiter_custom_ar.allocate_meta_buffer(size)
 
-    def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
-        return sgl_kernel.allreduce.get_meta_buffer_ipc_handle(inp)
+        def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
+            return aiter_custom_ar.get_meta_buffer_ipc_handle(inp)
+
+    else:
+
+        def init_custom_ar(
+            meta: torch.Tensor,
+            rank_data: torch.Tensor,
+            handles: List[str],
+            offsets: List[int],
+            rank: int,
+            full_nvlink: bool,
+        ) -> int:
+            return sgl_kernel.allreduce.init_custom_ar(
+                meta, rank_data, handles, offsets, rank, full_nvlink
+            )
+
+        def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
+            sgl_kernel.allreduce.all_reduce_reg(fa, inp, out)
+
+        def all_reduce_unreg(
+            fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+        ) -> None:
+            sgl_kernel.allreduce.all_reduce_unreg(fa, inp, reg_buffer, out)
+
+        def dispose(fa: int) -> None:
+            sgl_kernel.allreduce.dispose(fa)
+
+        def meta_size() -> int:
+            return sgl_kernel.allreduce.meta_size()
+
+        def register_buffer(
+            fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
+        ) -> None:
+            return sgl_kernel.allreduce.register_buffer(fa, t, handles, offsets)
+
+        def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
+            return sgl_kernel.allreduce.get_graph_buffer_ipc_meta(fa)
+
+        def register_graph_buffers(
+            fa: int, handles: List[str], offsets: List[List[int]]
+        ) -> None:
+            sgl_kernel.allreduce.register_graph_buffers(fa, handles, offsets)
+
+        def allocate_meta_buffer(size: int) -> torch.Tensor:
+            return sgl_kernel.allreduce.allocate_meta_buffer(size)
+
+        def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
+            return sgl_kernel.allreduce.get_meta_buffer_ipc_handle(inp)
 
 
 def mscclpp_generate_unique_id() -> bytes:
