@@ -880,16 +880,16 @@ def sample_random_requests(
     random_sample: bool = True,
     return_text: bool = True,
 ) -> List[DatasetRow]:
-    input_lens = np.random.randint(
-        max(int(input_len * range_ratio), 1),
-        input_len + 1,
-        size=num_prompts,
-    )
-    output_lens = np.random.randint(
-        int(output_len * range_ratio),
-        output_len + 1,
-        size=num_prompts,
-    )
+    if not 0.0 <= range_ratio < 1.0:
+        raise ValueError("random_range_ratio must be in [0, 1).")
+
+    input_low  = max(int(input_len  * (1 - range_ratio)), 1)
+    input_high =        int(input_len  * (1 + range_ratio))
+    output_low  = max(int(output_len * (1 - range_ratio)), 1)
+    output_high =        int(output_len * (1 + range_ratio))
+
+    input_lens  = np.random.randint(input_low,  input_high  + 1, size=num_prompts)
+    output_lens = np.random.randint(output_low, output_high + 1, size=num_prompts)
 
     if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
