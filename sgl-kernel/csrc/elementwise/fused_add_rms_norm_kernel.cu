@@ -15,7 +15,7 @@ limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
 
-#include <flashinfer/norm.cuh>
+#include <flashinfer/norm.cuh> // TODO (Hubert)
 
 #include "utils.h"
 
