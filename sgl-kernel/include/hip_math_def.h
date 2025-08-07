@@ -15,8 +15,6 @@ limitations under the License.
 
 #pragma once
 
-#if defined(__HIP_PLATFORM_AMD__)
-
 #include <hip/hip_bf16.h>
 #include <hip/hip_common.h>
 #include <hip/hip_fp16.h>
@@ -90,5 +88,3 @@ __host__ __device__ __forceinline__ __half operator*(const __half& x, const __ha
   __half h_y = y;
   return __hmul(h_x, h_y);
 }
-
-#endif

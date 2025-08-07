@@ -32,6 +32,19 @@ limitations under the License.
     using c_type = __hip_bfloat16;       \
     return __VA_ARGS__();                \
   }
+
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
 #endif  // USE_ROCM
 
 #ifndef USE_ROCM
@@ -210,7 +223,7 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
 inline bool is_float8_tensor(const at::Tensor& tensor) {
   return tensor.scalar_type() == at::ScalarType::Float8_e4m3fn || tensor.scalar_type() == at::ScalarType::Float8_e5m2;
 }
-#endif  // USE_ROCM
+#endif  // end of !USE_ROCM
 
 struct cuda_error : public std::runtime_error {
   /**
@@ -275,10 +288,10 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
-#else
+#else  // USE_ROCM
 #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor((var), (lane_mask))
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor((var), (lane_mask), (width))
-#endif
+#endif  // USE_ROCM
 
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, ...)           \
   [&]() -> bool {                                                                        \
@@ -333,30 +346,6 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 }
 
 #endif
-
-// add FP8 support
-
-#ifndef USE_ROCM
-#include <c10/util/Float8_e4m3fn.h>
-using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-
-#else  // USE_ROCM
-
-#if HIP_FP8_TYPE_FNUZ
-#include <c10/util/Float8_e4m3fnuz.h>
-using FP8_TYPE = c10::Float8_e4m3fnuz;
-constexpr auto FP8_E4M3_MAX = 224.0f;
-#else
-#if HIP_FP8_TYPE_E4M3
-#include <c10/util/Float8_e4m3fn.h>
-using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-#else
-#error "fp8 is not supported in this processor (arch < gfx942)."
-#endif  // HIP_FP8_TYPE_E4M3
-#endif  // HIP_FP8_TYPE_FNUZ
-#endif  // USE_ROCM
 
 #define FULL_MASK 0xffffffff
 
@@ -427,3 +416,57 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
   if (x <= 1) return 1;
   return 1u << (32 - __builtin_clz(x - 1));
 }
+
+#ifdef USE_ROCM
+#include "hip_exception.h"
+
+#ifndef NDEBUG
+#define SGL_HIP_CALL(func, ...)                                                                                      \
+  {                                                                                                                  \
+    cudaError_t e = (func);                                                                                          \
+    if (e != cudaSuccess) {                                                                                          \
+      std::cerr << "CUDA Error: " << cudaGetErrorString(e) << " (" << e << ") " << __FILE__ << ": line " << __LINE__ \
+                << " at function " << STR(func) << std::endl;                                                        \
+      return e;                                                                                                      \
+    }                                                                                                                \
+  }
+#else
+#define SGL_HIP_CALL(func, ...) \
+  {                             \
+    cudaError_t e = (func);     \
+    if (e != cudaSuccess) {     \
+      return e;                 \
+    }                           \
+  }
+#endif
+
+// convert head_dim to compile-time constant
+#define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)     \
+  switch (head_dim) {                                  \
+    case 64: {                                         \
+      constexpr size_t HEAD_DIM = 64;                  \
+      __VA_ARGS__                                      \
+      break;                                           \
+    }                                                  \
+    case 128: {                                        \
+      constexpr size_t HEAD_DIM = 128;                 \
+      __VA_ARGS__                                      \
+      break;                                           \
+    }                                                  \
+    case 256: {                                        \
+      constexpr size_t HEAD_DIM = 256;                 \
+      __VA_ARGS__                                      \
+      break;                                           \
+    }                                                  \
+    case 512: {                                        \
+      constexpr size_t HEAD_DIM = 512;                 \
+      __VA_ARGS__                                      \
+      break;                                           \
+    }                                                  \
+    default: {                                         \
+      std::ostringstream err_msg;                      \
+      err_msg << "Unsupported head_dim: " << head_dim; \
+      SGL_HIP_ERROR(err_msg.str());                    \
+    }                                                  \
+  }
+#endif

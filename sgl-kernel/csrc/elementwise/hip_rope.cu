@@ -13,11 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/pos_enc.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "hip_pos_enc.cuh"
+#include "hip_math_def.h"
+#include "hip_vec_dtypes.h"
+#include "pytorch_extension_utils_rocm.h"
 
-using namespace flashinfer;
+using namespace sgl_hip;
 
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,

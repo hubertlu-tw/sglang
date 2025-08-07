@@ -59,6 +59,84 @@ struct vec_t {
 
 namespace sgl_hip {
 
+template <typename DST, typename SRC>
+struct vec_cast {
+  template <size_t N>
+  __device__ __forceinline__ static void cast(DST* dst, const SRC* src) {
+#pragma unroll
+    for (size_t i = 0; i < N; ++i)
+      dst[i] = static_cast<DST>(src[i]);
+  }
+};
+
+// float  <-->  half
+template <>
+struct vec_cast<float, __half> {
+  template <size_t N>
+  __device__ __forceinline__ static void cast(float* dst, const __half* src) {
+    if constexpr (N == 1)
+      dst[0] = __half2float(src[0]);
+    else {
+#pragma unroll
+      for (size_t i = 0; i < N / 2; ++i)
+        reinterpret_cast<float2*>(dst)[i] = __half22float2(reinterpret_cast<const __half2*>(src)[i]);
+    }
+  }
+};
+template <>
+struct vec_cast<__half, float> {
+  template <size_t N>
+  __device__ __forceinline__ static void cast(__half* dst, const float* src) {
+    if constexpr (N == 1)
+      dst[0] = __float2half(src[0]);
+    else {
+#pragma unroll
+      for (size_t i = 0; i < N / 2; ++i)
+        reinterpret_cast<__half2*>(dst)[i] = __float22half2_rn(reinterpret_cast<const float2*>(src)[i]);
+    }
+  }
+};
+
+// float  <-->  bfloat16
+template <>
+struct vec_cast<float, __hip_bfloat16> {
+  template <size_t N>
+  __device__ __forceinline__ static void cast(float* dst, const __hip_bfloat16* src) {
+    if constexpr (N == 1)
+      dst[0] = __bfloat162float(src[0]);
+    else {
+#pragma unroll
+      for (size_t i = 0; i < N / 2; ++i)
+        reinterpret_cast<float2*>(dst)[i] = __bfloat1622float2(reinterpret_cast<const __hip_bfloat162*>(src)[i]);
+    }
+  }
+};
+template <>
+struct vec_cast<__hip_bfloat16, float> {
+  template <size_t N>
+  __device__ __forceinline__ static void cast(__hip_bfloat16* dst, const float* src) {
+    if constexpr (N == 1)
+      dst[0] = __float2bfloat16(src[0]);
+    else {
+#pragma unroll
+      for (size_t i = 0; i < N / 2; ++i)
+        reinterpret_cast<__hip_bfloat162*>(dst)[i] = __float22bfloat162_rn(reinterpret_cast<const float2*>(src)[i]);
+    }
+  }
+};
+
+template <typename dst_t, typename src_t, size_t vec_size>
+SGL_HIP_INLINE void cast_from_impl(vec_t<dst_t, vec_size>& dst, const vec_t<src_t, vec_size>& src) {
+  if constexpr (std::is_same_v<dst_t, src_t>) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i)
+      dst[i] = src[i];
+  } else {
+    // Delegate to vec_cast<dst,src>
+    vec_cast<dst_t, src_t>::template cast<vec_size>(dst.ptr(), const_cast<src_t*>(&src[0]));
+  }
+}
+
 template <typename srcDtype, typename dstDtype, size_t vec_size>
 SGL_HIP_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src_ptr) {
   if constexpr (std::is_same<srcDtype, dstDtype>::value) {

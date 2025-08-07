@@ -20,7 +20,7 @@ limitations under the License.
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
-   * From csrc/activation
+   * From csrc/elementwise
    */
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
@@ -33,6 +33,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
+
+  m.def(
+      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
+      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
   /*
    * From csrc/allreduce
    */

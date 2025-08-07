@@ -13,26 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_POS_ENC_CUH_
-#define FLASHINFER_POS_ENC_CUH_
+#ifndef SGL_HIP_POS_ENC_CUH_
+#define SGL_HIP_POS_ENC_CUH_
 
 #include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <algorithm>
 
-#include "layout.cuh" // TODO (Hubert)
-#ifndef USE_ROCM
-#include "math.cuh"
-#include "utils.cuh"
-#include "vec_dtypes.cuh"
-#else
-#include "hip_math_def.cuh"
-#include "utils.cuh"
-#include "hip_vec_dtypes.cuh"
-#endif
+#include "hip_layout.cuh"
+#include "utils.h"
 
-namespace flashinfer {
+#define FAST_LOG2F(x)  __log2f(x)
+#define FAST_EXP2F(x)  exp2f(x)
+namespace sgl_hip {
 
 /*!
  * \brief An enumeration class that defines different modes for applying RoPE
@@ -64,10 +59,21 @@ inline std::string PosEncodingModeToString(const PosEncodingMode& pos_encoding_m
   }
 }
 
-__device__ __forceinline__ float get_alibi_slope(uint32_t head_idx, uint32_t num_heads) {
-  int n = math::ptx_exp2((int)math::ptx_log2(num_heads));
-  return head_idx < n ? math::ptx_exp2(-8. * float(head_idx + 1) / float(n))
-                      : math::ptx_exp2(-4. * float((head_idx + 1 - n) * 2 - 1) / float(n));
+__device__ __forceinline__ uint32_t power2_floor(uint32_t x) {
+    return 1u << (31 - __builtin_clz(x));
+}
+
+__device__ __forceinline__ float get_alibi_slope(uint32_t head_idx,
+                                                 uint32_t num_heads) {
+    const uint32_t n = power2_floor(num_heads);
+    const float inv_n = 1.0f / static_cast<float>(n);
+
+    const float exponent =
+        (head_idx <  n)
+          ? -8.f * static_cast<float>(head_idx + 1)          * inv_n
+          : -4.f * static_cast<float>((head_idx + 1 - n)*2u - 1u) * inv_n;
+
+    return FAST_EXP2F(exponent);
 }
 
 /*!
@@ -589,17 +595,19 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
     bool interleave, cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+  SGL_HIP_CALL(cudaGetDevice(&dev_id));
+  SGL_HIP_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
       // operate on 16 Bytes at a time
-      constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      // constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      constexpr uint32_t vec_size = (16 / sizeof(DType)) > (HEAD_DIM / 32) ? (16 / sizeof(DType)) : (HEAD_DIM / 32);
       // how many threads needed per head_dim
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
       // how many threads needed per block
-      uint32_t num_threads = std::max(128U, bdx);
+      // uint32_t num_threads = std::max(128U, bdx);
+      uint32_t num_threads = 128U > bdx ? 128U : bdx;
       // how many tokens can we process in a block
       uint32_t bdy = num_threads / bdx;
       // how many blocks needed to process all tokens
@@ -626,21 +634,21 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
                                                                 DType, IdType>;
 
       int num_blocks_per_sm_0 = 0;
-      FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      SGL_HIP_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
       uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
 
       if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
         dim3 nblks(nblks_x);
         dim3 nthrs(bdx, bdy);
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+        SGL_HIP_CALL(hipLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
       } else {
         dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
         dim3 nthrs(bdx, bdy);
         auto kernel_1 =
             BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<INTERLEAVE, HEAD_DIM, vec_size,
                                                                      bdx, DType, IdType>;
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+        SGL_HIP_CALL(hipLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
       }
     });
   });
@@ -661,14 +669,16 @@ cudaError_t BatchQKApplyRotaryPosIds(
   float smooth_b = 0.f;
   int dev_id = 0;
   int num_sms = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+  SGL_HIP_CALL(cudaGetDevice(&dev_id));
+  SGL_HIP_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      // constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      constexpr uint32_t vec_size = (16 / sizeof(DType)) > (HEAD_DIM / 32) ? (16 / sizeof(DType)) : (HEAD_DIM / 32);
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
-      uint32_t num_threads = std::max(128U, bdx);
+      // uint32_t num_threads = std::max(128U, bdx);
+      uint32_t num_threads = 128U > bdx ? 128U : bdx;
       uint32_t bdy = num_threads / bdx;
       uint32_t nblks_x = (nnz + bdy - 1) / bdy;
 
@@ -697,21 +707,21 @@ cudaError_t BatchQKApplyRotaryPosIds(
           BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
 
       int num_blocks_per_sm_0 = 0;
-      FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      SGL_HIP_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
       uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
       if (nblks_x >= num_ctas_0) {
         dim3 nblks(nblks_x);
         dim3 nthrs(bdx, bdy);
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+        SGL_HIP_CALL(hipLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
       } else {
         dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
         dim3 nthrs(bdx, bdy);
         auto kernel_1 = BatchQKApplyRotaryPosIdsHeadParallelismKernel<INTERLEAVE, HEAD_DIM,
                                                                       vec_size, bdx, DType, IdType>;
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+        SGL_HIP_CALL(hipLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
       }
     });
   });
@@ -735,9 +745,11 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      // constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      constexpr uint32_t vec_size = (16 / sizeof(DType)) > (HEAD_DIM / 32) ? (16 / sizeof(DType)) : (HEAD_DIM / 32);
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
-      uint32_t num_threads = std::max(128U, bdx);
+      // uint32_t num_threads = std::max(128U, bdx);
+      uint32_t num_threads = 128U > bdx ? 128U : bdx;
       uint32_t bdy = num_threads / bdx;
       dim3 nblks(batch_size * (num_qo_heads + num_kv_heads));
       dim3 nthrs(bdx, bdy);
@@ -764,7 +776,7 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      SGL_HIP_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     });
   });
 
@@ -801,9 +813,11 @@ cudaError_t BatchQKApplyLlama31Rotary(
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      // constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      constexpr uint32_t vec_size = (16 / sizeof(DType)) > (HEAD_DIM / 32) ? (16 / sizeof(DType)) : (HEAD_DIM / 32);
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
-      uint32_t num_threads = std::max(128U, bdx);
+      // uint32_t num_threads = std::max(128U, bdx);
+      uint32_t num_threads = 128U > bdx ? 128U : bdx;
       uint32_t bdy = num_threads / bdx;
       dim3 nblks(batch_size * (num_qo_heads + num_kv_heads));
       dim3 nthrs(bdx, bdy);
@@ -830,7 +844,7 @@ cudaError_t BatchQKApplyLlama31Rotary(
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      SGL_HIP_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     });
   });
 
@@ -852,9 +866,11 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      // constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      constexpr uint32_t vec_size = (16u / sizeof(DType)) > (HEAD_DIM / 32u) ? (16u / sizeof(DType)) : (HEAD_DIM / 32u);
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
-      uint32_t num_threads = std::max(128U, bdx);
+      // uint32_t num_threads = std::max(128U, bdx);
+      uint32_t num_threads = 128U > bdx ? 128U : bdx;
       uint32_t bdy = num_threads / bdx;
       dim3 nblks((nnz + bdy - 1) / bdy);
       dim3 nthrs(bdx, bdy);
@@ -881,13 +897,13 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      SGL_HIP_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     });
   });
 
   return cudaSuccess;
 }
 
-}  // namespace flashinfer
+}  // namespace sgl_hip
 
-#endif  // FLASHINFER_POS_ENC_CUH_
+#endif  // SGL_HIP_POS_ENC_CUH_
