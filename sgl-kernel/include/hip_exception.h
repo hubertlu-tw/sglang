@@ -32,12 +32,12 @@ void write_to_stream(std::ostringstream& oss, T&& val, Args&&... args) {
   write_to_stream(oss, std::forward<Args>(args)...);
 }
 
-#define SGL_HIP_CHECK(condition, ...) \
+#define SGL_HIP_CHECK(condition, ...)    \
   if (!(condition)) {                    \
     std::ostringstream oss;              \
     write_to_stream(oss, __VA_ARGS__);   \
     std::cerr << oss.str() << std::endl; \
-    SGL_HIP_ERROR(oss.str());         \
+    SGL_HIP_ERROR(oss.str());            \
   }
 
 namespace sgl_hip {
@@ -53,7 +53,9 @@ class Error : public std::exception {
     message_ = oss.str();
   }
 
-  virtual const char* what() const noexcept override { return message_.c_str(); }
+  virtual const char* what() const noexcept override {
+    return message_.c_str();
+  }
 };
 
 }  // namespace sgl_hip
