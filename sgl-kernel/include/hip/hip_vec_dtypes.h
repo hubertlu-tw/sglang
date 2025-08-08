@@ -40,6 +40,7 @@ template <typename float_t, size_t vec_size>
 struct vec_t {
   SGL_HIP_INLINE float_t& operator[](size_t i);
   SGL_HIP_INLINE const float_t& operator[](size_t i) const;
+  SGL_HIP_INLINE void fill(float_t val);
   SGL_HIP_INLINE float_t* ptr();
 
   SGL_HIP_INLINE void load(const float_t* ptr);
