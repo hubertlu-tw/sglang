@@ -23,6 +23,7 @@ struct vec_t<half, 1> {
   SGL_HIP_INLINE const half& operator[](size_t i) const {
     return ((const half*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(half val);
   SGL_HIP_INLINE half* ptr() {
     return reinterpret_cast<half*>(&data);
   }
@@ -41,6 +42,10 @@ struct vec_t<half, 1> {
     cast_store_impl(ptr, *this);
   }
 };
+
+SGL_HIP_INLINE void vec_t<half, 1>::fill(half val) {
+  data = val;
+}
 
 SGL_HIP_INLINE void vec_t<half, 1>::load(const half* ptr) {
   data = *ptr;
@@ -61,6 +66,7 @@ struct vec_t<half, 2> {
   SGL_HIP_INLINE const half& operator[](size_t i) const {
     return ((const half*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(half val);
   SGL_HIP_INLINE half* ptr() {
     return reinterpret_cast<half*>(&data);
   }
@@ -79,6 +85,10 @@ struct vec_t<half, 2> {
     cast_store_impl(ptr, *this);
   }
 };
+
+SGL_HIP_INLINE void vec_t<half, 2>::fill(half val) {
+  data = make_half2(val, val);
+}
 
 SGL_HIP_INLINE void vec_t<half, 2>::load(const half* ptr) {
   data = *((half2*)ptr);
@@ -100,6 +110,7 @@ struct vec_t<half, 4> {
   SGL_HIP_INLINE const half& operator[](size_t i) const {
     return ((const half*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(half val);
   SGL_HIP_INLINE half* ptr() {
     return reinterpret_cast<half*>(&data);
   }
@@ -118,6 +129,11 @@ struct vec_t<half, 4> {
     cast_store_impl(ptr, *this);
   }
 };
+
+SGL_HIP_INLINE void vec_t<half, 4>::fill(half val) {
+  *(half2*)(&data.x) = make_half2(val, val);
+  *(half2*)(&data.y) = make_half2(val, val);
+}
 
 SGL_HIP_INLINE void vec_t<half, 4>::load(const half* ptr) {
   data = *((uint2*)ptr);
@@ -138,6 +154,15 @@ struct vec_t<half, vec_size> {
   }
   SGL_HIP_INLINE const half& operator[](size_t i) const {
     return ((const half*)data)[i];
+  }
+  SGL_HIP_INLINE void fill(half val) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      *(half2*)(&(data[i].x)) = make_half2(val, val);
+      *(half2*)(&(data[i].y)) = make_half2(val, val);
+      *(half2*)(&(data[i].z)) = make_half2(val, val);
+      *(half2*)(&(data[i].w)) = make_half2(val, val);
+    }
   }
   SGL_HIP_INLINE half* ptr() {
     return reinterpret_cast<half*>(&data);

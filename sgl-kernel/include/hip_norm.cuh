@@ -13,23 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_NORM_CUH_
-#define FLASHINFER_NORM_CUH_
+
+#ifndef SGL_HIP_NORM_CUH_
+#define SGL_HIP_NORM_CUH_
 
 #include <numeric>
 
-#include "flashinfer/utils.cuh"  // TODO (Hubert)
-#ifndef USE_ROCM
-#include "math.cuh"
-#include "utils.cuh"
-#include "vec_dtypes.cuh"
-#else
-#include "hip_math_def.cuh"
-#include "hip_vec_dtypes.cuh"
-#include "utils.cuh"
-#endif
+#include "utils.h"
 
-namespace flashinfer {
+namespace sgl_hip {
 
 namespace norm {
 
@@ -45,7 +37,7 @@ __global__ void RMSNormKernel(
     float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = WARP_SIZE;
   const uint32_t num_warps = blockDim.y;
   // NOTE(Zihao): it's guaranteed that num_warps should be smaller than 32
   const uint32_t thread_id = tx + ty * warp_size;
@@ -56,7 +48,7 @@ __global__ void RMSNormKernel(
   float sum_sq = 0.f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;");  // TODO (Hubert)
 #endif
 
   for (uint32_t i = 0; i < rounds; i++) {
@@ -74,7 +66,8 @@ __global__ void RMSNormKernel(
   // first, warp reduce sum
 #pragma unroll
   for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
-    sum_sq += math::shfl_xor_sync(sum_sq, offset);
+    // sum_sq += math::shfl_xor_sync(sum_sq, offset);
+    sum_sq += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_sq, offset);
   }
 
   smem[ty] = sum_sq;
@@ -84,13 +77,15 @@ __global__ void RMSNormKernel(
     sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
 #pragma unroll
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
-      sum_sq += math::shfl_xor_sync(sum_sq, offset);
+      // sum_sq += math::shfl_xor_sync(sum_sq, offset);
+      sum_sq += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_sq, offset);
     }
     smem[0] = sum_sq;
   }
   __syncthreads();
 
-  float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  // float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  float rms_rcp = rsqrtf(smem[0] / float(d) + eps);
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -111,7 +106,7 @@ __global__ void RMSNormKernel(
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  asm volatile("griddepcontrol.launch_dependents;");  // TODO (Hubert)
 #endif
 }
 
@@ -130,29 +125,45 @@ cudaError_t RMSNorm(
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   dim3 nblks(batch_size);
-  dim3 nthrs(32, num_warps);
+  dim3 nthrs(WARP_SIZE, num_warps);
   const uint32_t smem_size = num_warps * sizeof(float);
   float weight_bias = 0.f;
   void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
+  SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
+  // hipLaunchConfig_t config; // hipLaunchConfig_t
+  // config.gridDim = nblks;
+  // config.blockDim = nthrs;
+  // config.dynamicSmemBytes = smem_size;
+  // config.stream = stream;
+  // hipLaunchAttribute attrs[1]; // hipLaunchAttribute
 
-  cudaLaunchConfig_t config;
-  config.gridDim = nblks;
-  config.blockDim = nthrs;
-  config.dynamicSmemBytes = smem_size;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-  config.numAttrs = 1;
-  config.attrs = attrs;
+  // #ifndef USE_ROCM
+  //   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  //   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  // #else
+  //   attrs[0].id  = hipLaunchAttributePriority;
+  //   attrs[0].val.priority = enable_pdl ? 1 : 0;
+  // #endif
+
+  // config.numAttrs = 1;
+  // config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(
-        cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
+    // auto kernel = RMSNormKernel<VEC_SIZE, T>;
+    // SGL_HIP_CALL(hipFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)); //
+    // hipFuncSetAttribute SGL_HIP_CALL(
+    //     cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input, stride_output, weight_bias,
+    //     eps));
+
+    auto kernel = &RMSNormKernel<VEC_SIZE, T>;
+    SGL_HIP_CALL(hipFuncSetAttribute(
+        reinterpret_cast<const void*>(kernel),
+        // SGL_HIP_CALL(hipFuncSetAttribute(kernel,
+        hipFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size));
+    SGL_HIP_CALL(LAUNCH_KERNEL(&cfg, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
   });
   return cudaSuccess;
 }
@@ -169,7 +180,7 @@ __global__ void FusedAddRMSNormKernel(
     float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = WARP_SIZE;
   const uint32_t num_warps = blockDim.y;
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
@@ -179,7 +190,7 @@ __global__ void FusedAddRMSNormKernel(
 
   float sum_sq = 0.f;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;");  // TODO (Hubert)
 #endif
 
   for (uint32_t i = 0; i < rounds; i++) {
@@ -210,7 +221,8 @@ __global__ void FusedAddRMSNormKernel(
   // first, warp reduce sum
 #pragma unroll
   for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
-    sum_sq += math::shfl_xor_sync(sum_sq, offset);
+    // sum_sq += math::shfl_xor_sync(sum_sq, offset);
+    sum_sq += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_sq, offset);
   }
 
   smem[ty] = sum_sq;
@@ -220,13 +232,15 @@ __global__ void FusedAddRMSNormKernel(
     sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
 #pragma unroll
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
-      sum_sq += math::shfl_xor_sync(sum_sq, offset);
+      // sum_sq += math::shfl_xor_sync(sum_sq, offset);
+      sum_sq += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_sq, offset);
     }
     smem[0] = sum_sq;
   }
   __syncthreads();
 
-  float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  // float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  float rms_rcp = rsqrtf(smem[0] / float(d) + eps);
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -248,7 +262,7 @@ __global__ void FusedAddRMSNormKernel(
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  asm volatile("griddepcontrol.launch_dependents;");  // TODO (Hubert)
 #endif
 }
 
@@ -267,31 +281,42 @@ cudaError_t FusedAddRMSNorm(
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   dim3 nblks(batch_size);
-  dim3 nthrs(32, num_warps);
+  dim3 nthrs(WARP_SIZE, num_warps);
   const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
   float weight_bias = 0.f;
   void* args[] = {&input, &residual, &weight, &d, &stride_input, &stride_residual, &weight_bias, &eps};
+  SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
+  // cudaLaunchConfig_t config;
+  // config.gridDim = nblks;
+  // config.blockDim = nthrs;
+  // config.dynamicSmemBytes = smem_size;
+  // config.stream = stream;
+  // cudaLaunchAttribute attrs[1];
 
-  cudaLaunchConfig_t config;
-  config.gridDim = nblks;
-  config.blockDim = nthrs;
-  config.dynamicSmemBytes = smem_size;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-  config.numAttrs = 1;
-  config.attrs = attrs;
+  // #ifndef USE_ROCM
+  //   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  //   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  // #else
+  //   attrs[0].id  = hipLaunchAttributePriority;
+  //   attrs[0].val.priority = enable_pdl ? 1 : 0;
+  // #endif
+  // config.numAttrs = 1;
+  // config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-        &config, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
-  });
+    // auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
+    // SGL_HIP_CALL(hipFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    // SGL_HIP_CALL(cudaLaunchKernelEx(
+    //     &config, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
 
+    auto kernel = &FusedAddRMSNormKernel<VEC_SIZE, T>;
+    SGL_HIP_CALL(hipFuncSetAttribute(
+        reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    SGL_HIP_CALL(
+        LAUNCH_KERNEL(&cfg, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
+  });
   return cudaSuccess;
 }
 
@@ -310,29 +335,35 @@ cudaError_t GemmaRMSNorm(
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   dim3 nblks(batch_size);
-  dim3 nthrs(32, num_warps);
+  dim3 nthrs(WARP_SIZE, num_warps);
   const uint32_t smem_size = num_warps * sizeof(float);
   float weight_bias = 1.f;
   void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
-
-  cudaLaunchConfig_t config;
-  config.gridDim = nblks;
-  config.blockDim = nthrs;
-  config.dynamicSmemBytes = smem_size;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-  config.numAttrs = 1;
-  config.attrs = attrs;
+  SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
+  // cudaLaunchConfig_t config;
+  // config.gridDim = nblks;
+  // config.blockDim = nthrs;
+  // config.dynamicSmemBytes = smem_size;
+  // config.stream = stream;
+  // cudaLaunchAttribute attrs[1];
+  // attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  // attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  // config.numAttrs = 1;
+  // config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(
-        cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
+    // auto kernel = RMSNormKernel<VEC_SIZE, T>;
+    // SGL_HIP_CALL(hipFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    // SGL_HIP_CALL(
+    //     cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input, stride_output, weight_bias,
+    //     eps));
+
+    auto kernel = &RMSNormKernel<VEC_SIZE, T>;
+    SGL_HIP_CALL(hipFuncSetAttribute(
+        reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    SGL_HIP_CALL(LAUNCH_KERNEL(&cfg, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
   });
   return cudaSuccess;
 }
@@ -352,37 +383,49 @@ cudaError_t GemmaFusedAddRMSNorm(
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   dim3 nblks(batch_size);
-  dim3 nthrs(32, num_warps);
+  dim3 nthrs(WARP_SIZE, num_warps);
   // NOTE(Zihao): use ceil_div(num_warps, 4) * 4 for address alignment to 16 bytes
   const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
   float weight_bias = 1.f;
   void* args[] = {&input, &residual, &weight, &d, &stride_input, &stride_residual, &weight_bias, &eps};
-
-  cudaLaunchConfig_t config;
-  config.gridDim = nblks;
-  config.blockDim = nthrs;
-  config.dynamicSmemBytes = smem_size;
-  config.stream = stream;
+  SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
+  cfg.shared_mem_bytes = smem_size;
+// cudaLaunchConfig_t config;
+// config.gridDim = nblks;
+// config.blockDim = nthrs;
+// config.dynamicSmemBytes = smem_size;
+// config.stream = stream;
+#ifndef USE_ROCM
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
-
+#endif
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-        &config, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
+    // using KernelT = FusedAddRMSNormKernel<VEC_SIZE, T>;
+    // auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
+    auto kernel = &FusedAddRMSNormKernel<VEC_SIZE, T>;
+    SGL_HIP_CALL(hipFuncSetAttribute(
+        reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    SGL_HIP_CALL(
+        LAUNCH_KERNEL(&cfg, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
   });
+
+  // DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+  //   auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
+  //   SGL_HIP_CALL(hipFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  //   SGL_HIP_CALL(cudaLaunchKernelEx(
+  //       &config, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
+  // });
 
   return cudaSuccess;
 }
 
 }  // namespace norm
 
-}  // namespace flashinfer
+}  // namespace sgl_hip
 
-#endif  // FLASHINFER_NORM_CUH_
+#endif  // SGL_HIP_NORM_CUH_

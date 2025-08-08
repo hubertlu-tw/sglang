@@ -469,4 +469,86 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
       SGL_HIP_ERROR(err_msg.str());                    \
     }                                                  \
   }
-#endif
+
+#define DISPATCH_ALIGNED_VEC_SIZE(aligned_vec_size, ALIGNED_VEC_SIZE, ...) \
+  switch (aligned_vec_size) {                                              \
+    case 16: {                                                             \
+      constexpr size_t ALIGNED_VEC_SIZE = 16;                              \
+      __VA_ARGS__                                                          \
+      break;                                                               \
+    }                                                                      \
+    case 8: {                                                              \
+      constexpr size_t ALIGNED_VEC_SIZE = 8;                               \
+      __VA_ARGS__                                                          \
+      break;                                                               \
+    }                                                                      \
+    case 4: {                                                              \
+      constexpr size_t ALIGNED_VEC_SIZE = 4;                               \
+      __VA_ARGS__                                                          \
+      break;                                                               \
+    }                                                                      \
+    case 2: {                                                              \
+      constexpr size_t ALIGNED_VEC_SIZE = 2;                               \
+      __VA_ARGS__                                                          \
+      break;                                                               \
+    }                                                                      \
+    case 1: {                                                              \
+      constexpr size_t ALIGNED_VEC_SIZE = 1;                               \
+      __VA_ARGS__                                                          \
+      break;                                                               \
+    }                                                                      \
+    default: {                                                             \
+      std::ostringstream err_msg;                                          \
+      err_msg << "Unsupported aligned_vec_size: " << aligned_vec_size;     \
+      SGL_HIP_ERROR(err_msg.str());                                        \
+    }                                                                      \
+  }
+
+// ROCm helper functions and structures
+namespace rocm::experimental {
+typedef struct {
+  dim3 num_sms;
+  dim3 num_threads;
+  unsigned int shared_mem_bytes;
+  hipStream_t stream;
+} hipLaunchConfig_t;
+
+// Compile time void** kernelArgs array fill with variadic arguments
+template <typename T>
+void fill_kernel_args(void** f, size_t idx, T&& arg) {
+  f[idx] = static_cast<void*>(std::addressof(arg));
+}
+
+template <typename Head, typename... Tail>
+void fill_kernel_args(void** f, size_t idx, Head&& head, Tail&&... tail) {
+  f[idx] = static_cast<void*>(std::addressof(head));
+  fill_kernel_args(f, idx + 1, std::forward<Tail>(tail)...);
+}
+}  // namespace rocm::experimental
+
+#ifndef SETUP_LAUNCH_CONFIG
+// The code below is a workaround for ROCm. All the proposed overhead
+// is to match current macro signatures and should be reworked once
+// cudaLaunchKernelExt() hip alternative is ready.
+#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
+  rocm::experimental::hipLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream};
+
+#endif  // #ifndef SETUP_LAUNCH_CONFIG
+
+#ifndef LAUNCH_KERNEL
+template <typename T, typename Kern, typename... Args>
+inline hipError_t LAUNCH_KERNEL(T&& config, Kern&& kernel, Args&&... args) {
+  constexpr size_t k_num_kernel_args = sizeof...(args);
+  void* kernel_args[k_num_kernel_args];
+  rocm::experimental::fill_kernel_args(kernel_args, 0, std::forward<Args>(args)...);
+  return (hipLaunchCooperativeKernel(
+      std::forward<Kern>(kernel),
+      config->num_sms,
+      config->num_threads,
+      kernel_args,
+      config->shared_mem_bytes,
+      config->stream));
+}
+
+#endif  // #ifndef LAUNCH_KERNEL
+#endif  // #ifdef USE_ROCM

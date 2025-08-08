@@ -29,6 +29,7 @@ struct vec_t<nv_bfloat16, 1> {
   SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(nv_bfloat16 val);
   SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
@@ -47,6 +48,10 @@ struct vec_t<nv_bfloat16, 1> {
     cast_store_impl(ptr, *this);
   }
 };
+
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 1>::fill(nv_bfloat16 val) {
+  data = val;
+}
 
 SGL_HIP_INLINE void vec_t<nv_bfloat16, 1>::load(const nv_bfloat16* ptr) {
   data = *ptr;
@@ -67,6 +72,7 @@ struct vec_t<nv_bfloat16, 2> {
   SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(nv_bfloat16 val);
   SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
@@ -86,6 +92,10 @@ struct vec_t<nv_bfloat16, 2> {
   }
 };
 
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 2>::fill(nv_bfloat16 val) {
+  data = make_bfloat162(val, val);
+}
+
 SGL_HIP_INLINE void vec_t<nv_bfloat16, 2>::load(const nv_bfloat16* ptr) {
   data = *((nv_bfloat162*)ptr);
 }
@@ -104,6 +114,7 @@ struct vec_t<nv_bfloat16, 4> {
   SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(nv_bfloat16 val);
   SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
@@ -122,6 +133,11 @@ struct vec_t<nv_bfloat16, 4> {
     cast_store_impl(ptr, *this);
   }
 };
+
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 4>::fill(nv_bfloat16 val) {
+  *(nv_bfloat162*)(&data.x) = make_bfloat162(val, val);
+  *(nv_bfloat162*)(&data.y) = make_bfloat162(val, val);
+}
 
 SGL_HIP_INLINE void vec_t<nv_bfloat16, 4>::load(const nv_bfloat16* ptr) {
   data = *((uint2*)ptr);
@@ -142,6 +158,15 @@ struct vec_t<nv_bfloat16, vec_size> {
   }
   SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)data)[i];
+  }
+  SGL_HIP_INLINE void fill(nv_bfloat16 val) {
+#pragma unoll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      *(nv_bfloat162*)(&(data[i].x)) = make_bfloat162(val, val);
+      *(nv_bfloat162*)(&(data[i].y)) = make_bfloat162(val, val);
+      *(nv_bfloat162*)(&(data[i].z)) = make_bfloat162(val, val);
+      *(nv_bfloat162*)(&(data[i].w)) = make_bfloat162(val, val);
+    }
   }
   SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);

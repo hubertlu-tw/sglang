@@ -88,3 +88,10 @@ __host__ __device__ __forceinline__ __half operator*(const __half& x, const __ha
   __half h_y = y;
   return __hmul(h_x, h_y);
 }
+
+namespace sgl_hip {
+template <typename T1, typename T2>
+__forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
+  return (x + y - 1) / y;
+}
+}  // namespace sgl_hip

@@ -15,11 +15,11 @@ limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
 
-#include <flashinfer/norm.cuh>
-
+#include "hip_norm.cuh"
+#include "pytorch_extension_utils_rocm.h"
 #include "utils.h"
 
-using namespace flashinfer;
+using namespace sgl_hip;
 
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl) {

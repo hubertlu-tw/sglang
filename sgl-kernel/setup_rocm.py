@@ -45,6 +45,7 @@ sources = [
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/hip_rope.cu",
+    "csrc/elementwise/hip_fused_add_rms_norm_kernel.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/speculative/eagle_utils.cu",

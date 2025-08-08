@@ -18,6 +18,7 @@ struct vec_t<float, 1> {
   SGL_HIP_INLINE const float& operator[](size_t i) const {
     return ((const float*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(float val);
   SGL_HIP_INLINE float* ptr() {
     return reinterpret_cast<float*>(&data);
   }
@@ -36,6 +37,10 @@ struct vec_t<float, 1> {
     cast_store_impl(ptr, *this);
   }
 };
+
+SGL_HIP_INLINE void vec_t<float, 1>::fill(float val) {
+  data = val;
+}
 
 SGL_HIP_INLINE void vec_t<float, 1>::load(const float* ptr) {
   data = *ptr;
@@ -57,6 +62,7 @@ struct vec_t<float, 2> {
   SGL_HIP_INLINE const float& operator[](size_t i) const {
     return ((const float*)(&data))[i];
   }
+  SGL_HIP_INLINE void fill(float val);
   SGL_HIP_INLINE float* ptr() {
     return reinterpret_cast<float*>(&data);
   }
@@ -76,6 +82,10 @@ struct vec_t<float, 2> {
   }
 };
 
+SGL_HIP_INLINE void vec_t<float, 2>::fill(float val) {
+  data = make_float2(val, val);
+}
+
 SGL_HIP_INLINE void vec_t<float, 2>::load(const float* ptr) {
   data = *((float2*)ptr);
 }
@@ -94,6 +104,12 @@ struct vec_t<float, vec_size> {
   }
   SGL_HIP_INLINE const float& operator[](size_t i) const {
     return ((const float*)(data))[i];
+  }
+  SGL_HIP_INLINE void fill(float val) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      data[i] = make_float4(val, val, val, val);
+    }
   }
   SGL_HIP_INLINE float* ptr() {
     return reinterpret_cast<float*>(&data);
