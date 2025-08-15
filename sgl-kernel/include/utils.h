@@ -332,7 +332,8 @@ inline bool getEnvEnablePDL() {
 
 #include "hip_math_def.h"
 #include "hip_vec_dtypes.h"
-
+#include "math.cuh"
+// TODO (Hubert): castToFloat & castFromFloat
 #else
 
 template <typename srcDtype>
@@ -367,11 +368,11 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
 }
 
 __device__ __forceinline__ float warpReduceMax(float value) {
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 16));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 8));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 4));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 2));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 1));
+  value = fmaxf(value, SGLANG_SHFL_XOR_SYNC(FULL_MASK, value, 16));
+  value = fmaxf(value, SGLANG_SHFL_XOR_SYNC(FULL_MASK, value, 8));
+  value = fmaxf(value, SGLANG_SHFL_XOR_SYNC(FULL_MASK, value, 4));
+  value = fmaxf(value, SGLANG_SHFL_XOR_SYNC(FULL_MASK, value, 2));
+  value = fmaxf(value, SGLANG_SHFL_XOR_SYNC(FULL_MASK, value, 1));
   return value;
 }
 
@@ -549,6 +550,15 @@ inline hipError_t LAUNCH_KERNEL(T&& config, Kern&& kernel, Args&&... args) {
       config->shared_mem_bytes,
       config->stream));
 }
-
 #endif  // #ifndef LAUNCH_KERNEL
+
+#ifndef LAUNCH_KERNEL_NON_COOPERATIVE
+template <auto Kernel, typename Cfg, typename... Args>
+inline hipError_t LAUNCH_KERNEL_NON_COOPERATIVE(Cfg* cfg, Args&&... args) {
+  // cfg->num_sms and cfg->num_threads are already dim3 in your config struct
+  Kernel<<<cfg->num_sms, cfg->num_threads, cfg->shared_mem_bytes, cfg->stream>>>(std::forward<Args>(args)...);
+  return hipGetLastError();
+}
+#endif  // LAUNCH_KERNEL_NON_COOPERATIVE
+
 #endif  // #ifdef USE_ROCM

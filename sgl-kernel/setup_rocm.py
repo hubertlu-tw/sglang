@@ -82,7 +82,7 @@ hipcc_flags = [
     "-fPIC",
     "-std=c++17",
     "-D__HIP_PLATFORM_AMD__=1",
-    "-ffast-math",
+    # "-ffast-math", # TODO (Hubert)
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
