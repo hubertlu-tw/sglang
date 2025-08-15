@@ -22,7 +22,7 @@
 #include <iostream>
 #include <string>
 
-#include "hip_layout.cuh"
+#include "hip/hip_layout.cuh"
 #include "utils.h"
 
 #define FAST_LOG2F(x) __log2f(x)

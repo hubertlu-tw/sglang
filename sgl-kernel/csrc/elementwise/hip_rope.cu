@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "hip_math_def.h"
-#include "hip_pos_enc.cuh"
-#include "hip_vec_dtypes.h"
-#include "pytorch_extension_utils_rocm.h"
+#include "hip/hip_math_def.h"
+#include "hip/hip_pos_enc.cuh"
+#include "hip/hip_vec_dtypes.h"
+#include "hip/pytorch_extension_utils_rocm.h"
 
 using namespace sgl_hip;
 

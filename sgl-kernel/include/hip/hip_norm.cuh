@@ -59,7 +59,8 @@ __global__ void RMSNormKernel(
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      sum_sq += float(input_vec[j]) * float(input_vec[j]);
+      // sum_sq += float(input_vec[j]) * float(input_vec[j]);  // TODO (Hubert)
+      sum_sq += to_float<T>(input_vec[j]) * to_float<T>(input_vec[j]);
     }
   }
 
@@ -85,7 +86,10 @@ __global__ void RMSNormKernel(
   __syncthreads();
 
   // float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
-  float rms_rcp = rsqrtf(smem[0] / float(d) + eps);
+  // float rms_rcp = rsqrtf(smem[0] / float(d) + eps); // TODO (Hubert): accuracy issue
+  float mean_sq = smem[0] / float(d);
+  // prefer accuracy: standard sqrt, not the fast rsqrt intrinsic
+  float rms_rcp = 1.0f / sqrtf(mean_sq + eps);
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -99,7 +103,8 @@ __global__ void RMSNormKernel(
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      output_vec[j] = float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j]));
+      // output_vec[j] = float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j])); // TODO (Hubert)
+      output_vec[j] = from_float<T>(to_float<T>(input_vec[j]) * rms_rcp * (weight_bias + to_float<T>(weight_vec[j])));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.store(output + bx * stride_output + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -132,6 +137,7 @@ cudaError_t RMSNorm(
   float weight_bias = 0.f;
   void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
   SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
+  cfg.shared_mem_bytes = smem_size;
   // hipLaunchConfig_t config; // hipLaunchConfig_t
   // config.gridDim = nblks;
   // config.blockDim = nthrs;
@@ -163,7 +169,12 @@ cudaError_t RMSNorm(
         // SGL_HIP_CALL(hipFuncSetAttribute(kernel,
         hipFuncAttributeMaxDynamicSharedMemorySize,
         smem_size));
-    SGL_HIP_CALL(LAUNCH_KERNEL(&cfg, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
+    SGL_HIP_CALL(
+        // LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, kernel, input, weight, output, d, stride_input, stride_output,
+        // weight_bias, eps)); LAUNCH_KERNEL_NON_COOPERATIVE<kernel>(&cfg, kernel, input, weight, output, d,
+        // stride_input, stride_output, weight_bias, eps));
+        (LAUNCH_KERNEL_NON_COOPERATIVE<&RMSNormKernel<VEC_SIZE, T>>(
+            &cfg, input, weight, output, d, stride_input, stride_output, weight_bias, eps)));  // TODO
   });
   return cudaSuccess;
 }
@@ -206,11 +217,15 @@ __global__ void FusedAddRMSNormKernel(
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      float x = float(input_vec[j]);
-      x += float(residual_vec[j]);
+      // float x = float(input_vec[j]); // TODO (Hubert)
+      float x = to_float<T>(input_vec[j]);
+      // x += float(residual_vec[j]);  // TODO (Hubert): no viable conversion from 'float' to 'half' (aka '__half'),
+      // castToFloat & castFromFloat
+      x += to_float<T>(residual_vec[j]);
       sum_sq += x * x;
-      residual_vec[j] = (T)x;
-      x_vec[j] = x;
+      // residual_vec[j] = (T)x;
+      residual_vec[j] = from_float<T>(x);
+      x_vec[j] = x;  // keep FP32 copy
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       residual_vec.store(residual + bx * stride_residual + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -240,7 +255,10 @@ __global__ void FusedAddRMSNormKernel(
   __syncthreads();
 
   // float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
-  float rms_rcp = rsqrtf(smem[0] / float(d) + eps);
+  // float rms_rcp = rsqrtf(smem[0] / float(d) + eps); // TODO (Hubert): accuracy issue?
+  float mean_sq = smem[0] / float(d);
+  // prefer accuracy: standard sqrt, not the fast rsqrt intrinsic
+  float rms_rcp = 1.0f / sqrtf(mean_sq + eps);
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -255,7 +273,10 @@ __global__ void FusedAddRMSNormKernel(
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      input_vec[j] = x_vec[j] * rms_rcp * (weight_bias + float(weight_vec[j]));
+      // input_vec[j] = x_vec[j] * rms_rcp * (weight_bias + float(weight_vec[j])); // TODO
+      const float w = to_float<T>(weight_vec[j]);
+      const float out = x_vec[j] * rms_rcp * (weight_bias + w);
+      input_vec[j] = from_float<T>(out);  // write back in T
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.store(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -284,10 +305,12 @@ cudaError_t FusedAddRMSNorm(
   const uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   dim3 nblks(batch_size);
   dim3 nthrs(WARP_SIZE, num_warps);
-  const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
+  const uint32_t smem_size =
+      (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);  // TODO: Exceed MI300X's per-block LDS limit (64 KB)
   float weight_bias = 0.f;
   void* args[] = {&input, &residual, &weight, &d, &stride_input, &stride_residual, &weight_bias, &eps};
   SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
+  cfg.shared_mem_bytes = smem_size;
   // cudaLaunchConfig_t config;
   // config.gridDim = nblks;
   // config.blockDim = nthrs;
@@ -315,7 +338,10 @@ cudaError_t FusedAddRMSNorm(
     SGL_HIP_CALL(hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     SGL_HIP_CALL(
-        LAUNCH_KERNEL(&cfg, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
+        // LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, kernel, input, residual, weight, d, stride_input, stride_residual,
+        // weight_bias, eps));
+        (LAUNCH_KERNEL_NON_COOPERATIVE<&FusedAddRMSNormKernel<VEC_SIZE, T>>(
+            &cfg, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps)));  // TODO
   });
   return cudaSuccess;
 }
@@ -342,6 +368,7 @@ cudaError_t GemmaRMSNorm(
   float weight_bias = 1.f;
   void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
   SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
+  cfg.shared_mem_bytes = smem_size;
   // cudaLaunchConfig_t config;
   // config.gridDim = nblks;
   // config.blockDim = nthrs;
@@ -363,7 +390,12 @@ cudaError_t GemmaRMSNorm(
     auto kernel = &RMSNormKernel<VEC_SIZE, T>;
     SGL_HIP_CALL(hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    SGL_HIP_CALL(LAUNCH_KERNEL(&cfg, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
+    SGL_HIP_CALL(
+        // LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, kernel, input, weight, output, d, stride_input, stride_output,
+        // weight_bias, eps)); LAUNCH_KERNEL_NON_COOPERATIVE<kernel>(&cfg, kernel, input, weight, output, d,
+        // stride_input, stride_output, weight_bias, eps));
+        (LAUNCH_KERNEL_NON_COOPERATIVE<&RMSNormKernel<VEC_SIZE, T>>(
+            &cfg, input, weight, output, d, stride_input, stride_output, weight_bias, eps)));  // TODO
   });
   return cudaSuccess;
 }
@@ -387,7 +419,8 @@ cudaError_t GemmaFusedAddRMSNorm(
   dim3 nblks(batch_size);
   dim3 nthrs(WARP_SIZE, num_warps);
   // NOTE(Zihao): use ceil_div(num_warps, 4) * 4 for address alignment to 16 bytes
-  const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
+  const uint32_t smem_size =
+      (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);  // TODO: Exceed MI300X's per-block LDS limit (64 KB)
   float weight_bias = 1.f;
   void* args[] = {&input, &residual, &weight, &d, &stride_input, &stride_residual, &weight_bias, &eps};
   SETUP_LAUNCH_CONFIG(nblks, nthrs, stream);  // creates  cfg
@@ -411,7 +444,10 @@ cudaError_t GemmaFusedAddRMSNorm(
     SGL_HIP_CALL(hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     SGL_HIP_CALL(
-        LAUNCH_KERNEL(&cfg, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
+        // LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, kernel, input, residual, weight, d, stride_input, stride_residual,
+        // weight_bias, eps));
+        (LAUNCH_KERNEL_NON_COOPERATIVE<&FusedAddRMSNormKernel<VEC_SIZE, T>>(
+            &cfg, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps)));  // TODO
   });
 
   // DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
