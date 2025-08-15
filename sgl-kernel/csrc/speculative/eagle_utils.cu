@@ -20,7 +20,7 @@
 #ifndef USE_ROCM
 #include "pytorch_extension_utils.h"
 #else
-#include "pytorch_extension_utils_rocm.h"
+#include "hip/pytorch_extension_utils_rocm.h"
 #endif
 
 typedef enum { FULL_MASK = 0, QLEN_ONLY = 1, QLEN_ONLY_BITPACKING = 2 } TreeMaskMode;
