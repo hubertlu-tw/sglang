@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -38,6 +38,9 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 class GPTQMarlinState(Enum):
@@ -274,20 +277,47 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
 
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
-            use_fp8_w8a8=True,
-            per_channel_quant=self.weight_quant.strategy
-            == QuantizationStrategy.CHANNEL,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-        )
+        # TODO (Hubert): fix this for Llama 4 FP8
+        if (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and moe_runner_config.apply_router_weight_on_input
+        ):
+            if _use_aiter:
+                from sglang.srt.layers.moe.rocm_aiter_fused_moe import rocm_aiter_fused_experts
+            else:
+                raise ValueError(
+                    "aiter is required for asm_moe_tkw1 used in Llama 4 FP8",
+                )
+            return rocm_aiter_fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_output=topk_output,
+                moe_runner_config=moe_runner_config,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+        else:
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_output=topk_output,
+                moe_runner_config=moe_runner_config,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):

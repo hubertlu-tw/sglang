@@ -2206,7 +2206,8 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
         elif "Llama4" in model_arch:
-            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+            # assert self.attention_backend == "fa3", "fa3 is required for Llama4 model" # TODO (Hubert)
+            pass  # TODO (Hubert)
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
