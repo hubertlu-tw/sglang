@@ -38,7 +38,46 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    # workaround for aiter's get_rope
+    import inspect
+    import types
+
+    import aiter.rotary_embedding as _aiter_re
+    from aiter.rotary_embedding import get_rope
+
+    _orig_get_rope = _aiter_re.get_rope
+
+    # Detect whether the upstream function already knows that keyword
+    if (
+        "dual_chunk_attention_config"
+        not in inspect.signature(_orig_get_rope).parameters
+    ):
+
+        def _patched_get_rope(*args, dual_chunk_attention_config=None, **kwargs):
+            """
+            Wrapper around aiter.rotary_embedding.get_rope that ignores
+            `dual_chunk_attention_config` when the upstream implementation
+            does not accept it.
+            """
+            # Just throw the value away; you could also log or assert.
+            return _orig_get_rope(*args, **kwargs)
+
+        # Ensure the wrapper looks like the original
+        _patched_get_rope = types.update_wrapper(_patched_get_rope, _orig_get_rope)
+
+        # Monkey-patch
+        _aiter_re.get_rope = _patched_get_rope
+
+    # Finally, import the (possibly patched) symbol for local use
+    get_rope = _aiter_re.get_rope
+else:
+    from sglang.srt.layers.rotary_embedding import get_rope
+
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
