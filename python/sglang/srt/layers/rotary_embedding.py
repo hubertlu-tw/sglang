@@ -25,7 +25,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
@@ -98,11 +98,12 @@ class RotaryEmbedding(CustomOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        if not (_is_cuda or _is_hip):
             cache = cache.to(dtype)
 
         if (
-            not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512]
+            not (_is_cuda or _is_npu or _is_hip)
+            or self.head_size not in [64, 128, 256, 512]
         ) and not (_is_cpu and _is_cpu_amx_available):
             from vllm._custom_ops import rotary_embedding
 
@@ -224,7 +225,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+        if (_is_cuda or _is_hip) and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -690,8 +691,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
 
         # Re-dispatch
-        if _is_hip:
-            self._forward_method = self.forward_native
+        if _is_hip:  # TODO (Hubert): check this!
+            self._forward_method = self.forward_cuda
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
@@ -1983,7 +1984,8 @@ def get_rope_wrapper(
     device: Optional[str] = None,
 ):
     if device != "cpu":
-        wrapper = aiter_get_rope if _use_aiter else get_rope
+        # wrapper = aiter_get_rope if _use_aiter else get_rope
+        wrapper = get_rope
         return wrapper(
             head_size,
             rotary_dim,
