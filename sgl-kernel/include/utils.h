@@ -595,13 +595,18 @@ inline hipError_t LAUNCH_KERNEL(T&& config, Kern&& kernel, Args&&... args) {
 }
 #endif  // #ifndef LAUNCH_KERNEL
 
-#ifndef LAUNCH_KERNEL_NON_COOPERATIVE
-template <auto Kernel, typename Cfg, typename... Args>
-inline hipError_t LAUNCH_KERNEL_NON_COOPERATIVE(Cfg* cfg, Args&&... args) {
-  // cfg->num_sms and cfg->num_threads are already dim3 in your config struct
-  Kernel<<<cfg->num_sms, cfg->num_threads, cfg->shared_mem_bytes, cfg->stream>>>(std::forward<Args>(args)...);
-  return hipGetLastError();
+template <typename Kern, typename Cfg, typename... Args>
+inline hipError_t launch_kernel_non_coop(Cfg* cfg,
+                                         Kern  kernel,     // pass pointer
+                                         Args&&... args)
+{
+    hipLaunchKernelGGL(kernel,
+                       cfg->num_sms,
+                       cfg->num_threads,
+                       cfg->shared_mem_bytes,
+                       cfg->stream,
+                       std::forward<Args>(args)...);
+    return hipGetLastError();
 }
-#endif  // LAUNCH_KERNEL_NON_COOPERATIVE
 
 #endif  // #ifdef USE_ROCM
