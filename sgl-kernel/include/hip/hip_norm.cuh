@@ -163,8 +163,8 @@ cudaError_t RMSNorm(
         // SGL_HIP_CALL(hipFuncSetAttribute(kernel,
         hipFuncAttributeMaxDynamicSharedMemorySize,
         smem_size));
-    SGL_HIP_CALL(launch_kernel_non_coop(&cfg, kernel,
-                                    input, weight, output, d, stride_input, stride_output, weight_bias, eps));
+    SGL_HIP_CALL(
+        launch_kernel_non_coop(&cfg, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
   });
   return cudaSuccess;
 }
@@ -322,8 +322,8 @@ cudaError_t FusedAddRMSNorm(
     auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
     SGL_HIP_CALL(hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    SGL_HIP_CALL(launch_kernel_non_coop(&cfg, kernel,
-                                    input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
+    SGL_HIP_CALL(launch_kernel_non_coop(
+        &cfg, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
   });
   return cudaSuccess;
 }
@@ -372,8 +372,8 @@ cudaError_t GemmaRMSNorm(
     auto kernel = RMSNormKernel<VEC_SIZE, T>;
     SGL_HIP_CALL(hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    SGL_HIP_CALL(launch_kernel_non_coop(&cfg, kernel,
-                                    input, weight, output, d, stride_input, stride_output, weight_bias, eps));
+    SGL_HIP_CALL(
+        launch_kernel_non_coop(&cfg, kernel, input, weight, output, d, stride_input, stride_output, weight_bias, eps));
   });
   return cudaSuccess;
 }
@@ -421,8 +421,8 @@ cudaError_t GemmaFusedAddRMSNorm(
     SGL_HIP_CALL(hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    SGL_HIP_CALL(launch_kernel_non_coop(&cfg, kernel,
-                                    input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
+    SGL_HIP_CALL(launch_kernel_non_coop(
+        &cfg, kernel, input, residual, weight, d, stride_input, stride_residual, weight_bias, eps));
   });
 
   // DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {

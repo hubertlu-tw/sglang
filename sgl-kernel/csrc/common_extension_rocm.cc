@@ -104,6 +104,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
 #endif
+  // TODO (Hubert): trtllm_allreduce
+  m.def("trtllm_lamport_initialize", &trtllm_lamport_initialize);
+  m.def("trtllm_lamport_initialize_all", &trtllm_lamport_initialize_all);
+  m.def("trtllm_custom_all_reduce", &trtllm_custom_all_reduce);
 
   /*
    * From csrc/moe

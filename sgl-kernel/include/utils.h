@@ -596,17 +596,13 @@ inline hipError_t LAUNCH_KERNEL(T&& config, Kern&& kernel, Args&&... args) {
 #endif  // #ifndef LAUNCH_KERNEL
 
 template <typename Kern, typename Cfg, typename... Args>
-inline hipError_t launch_kernel_non_coop(Cfg* cfg,
-                                         Kern  kernel,     // pass pointer
-                                         Args&&... args)
-{
-    hipLaunchKernelGGL(kernel,
-                       cfg->num_sms,
-                       cfg->num_threads,
-                       cfg->shared_mem_bytes,
-                       cfg->stream,
-                       std::forward<Args>(args)...);
-    return hipGetLastError();
+inline hipError_t launch_kernel_non_coop(
+    Cfg* cfg,
+    Kern kernel,  // pass pointer
+    Args&&... args) {
+  hipLaunchKernelGGL(
+      kernel, cfg->num_sms, cfg->num_threads, cfg->shared_mem_bytes, cfg->stream, std::forward<Args>(args)...);
+  return hipGetLastError();
 }
 
 #endif  // #ifdef USE_ROCM

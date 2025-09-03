@@ -73,6 +73,10 @@ torch::Tensor qr_get_handle(fptr_t _fa);
 void qr_open_handles(fptr_t _fa, const std::vector<torch::Tensor>& handles);
 void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t quant_level, bool cast_bf2half = false);
 int64_t qr_max_size();
+
+// TODO (Hubert): ROCm trtllm_reduce (trtllm_lamport_initialize, trtllm_lamport_initialize_all,
+// trtllm_custom_all_reduce)
+
 #else
 // custom allreduce
 fptr_t

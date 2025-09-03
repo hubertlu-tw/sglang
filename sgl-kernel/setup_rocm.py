@@ -43,6 +43,7 @@ include_dirs = [
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
+    "csrc/allreduce/hip_trtllm_allreduce.cu",  # TODO (Hubert)
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
