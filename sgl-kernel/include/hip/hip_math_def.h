@@ -85,10 +85,10 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 }
 
 // operator overload to support flashinfer
-__host__ __device__ __forceinline__ __half operator*(const __half& x, const __half& y) {
-  __half h_x = x;
-  __half h_y = y;
-  return __hmul(h_x, h_y);
-}
+// __host__ __device__ __forceinline__ __half operator*(const __half& x, const __half& y) {
+//   __half h_x = x;
+//   __half h_y = y;
+//   return __hmul(h_x, h_y);
+// }
 
 #endif

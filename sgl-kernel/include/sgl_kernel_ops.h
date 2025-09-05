@@ -143,6 +143,11 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
+#ifdef USE_ROCM
+void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double epsilon);
+void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon);
+#endif
+
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,

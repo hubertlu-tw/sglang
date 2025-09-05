@@ -46,41 +46,56 @@ def rmsnorm(
     return out
 
 
-def fused_add_rmsnorm(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-    enable_pdl: Optional[bool] = None,
-) -> None:
-    r"""Fused add root mean square normalization.
+if torch.version.hip is None:
 
-    Step 1:
-    ``residual[i] += input[i]``
+    def fused_add_rmsnorm(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> None:
+        r"""Fused add root mean square normalization.
 
-    Step 2:
-    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+        Step 1:
+        ``residual[i] += input[i]``
 
-    Parameters
-    ----------
-    input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
-    residual: torch.Tensor
-        Residual tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
-    eps: float
-        Epsilon for numerical stability.
-    enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
-    """
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+        Step 2:
+        ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+
+        Parameters
+        ----------
+        input: torch.Tensor
+            Input tensor, shape (batch_size, hidden_size).
+        residual: torch.Tensor
+            Residual tensor, shape (batch_size, hidden_size).
+        weight: torch.Tensor
+            Weight tensor, shape (hidden_size,).
+        eps: float
+            Epsilon for numerical stability.
+        enable_pdl: Optional[bool]
+            Whether to enable `programmatic dependent launch
+            <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+            If None, will be automatically enabled on Hopper architecture.
+        """
+        if enable_pdl is None:
+            enable_pdl = is_arch_support_pdl()
+        torch.ops.sgl_kernel.fused_add_rmsnorm.default(
+            input, residual, weight, eps, enable_pdl
+        )
+
+else:
+
+    def fused_add_rmsnorm(
+        # def fused_add_rms_norm(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> None:
+        torch.ops.sgl_kernel.fused_add_rms_norm.default(
+            input, residual, weight, epsilon
+        )
 
 
 def gemma_rmsnorm(
@@ -234,34 +249,25 @@ if torch.version.hip is not None:
         else:
             out = torch.empty_like(input)
 
-        torch.ops.sgl_kernel.gelu_quick(out, input)
+        torch.ops.sgl_kernel.gelu_quick.default(out, input)
         return out
 
     def rms_norm(
-        x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
-    ) -> torch.Tensor:
-        out = torch.empty_like(x)
-        torch.ops.sgl_kernel.rms_norm(
-            out,
-            x,
-            weight,
-            variance_epsilon,
-        )
-        return out
+        out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
+    ) -> None:
+        input_contiguous = input.contiguous()
+        torch.ops.sgl_kernel.rms_norm.default(out, input_contiguous, weight, epsilon)
 
-    def fused_add_rms_norm(
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        variance_epsilon: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        torch.ops.sgl_kernel.fused_add_rms_norm(
-            x,
-            residual,
-            weight,
-            variance_epsilon,
-        )
-        return x, residual
+    # def fused_add_rms_norm(
+    #         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+    #         variance_epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+    #     torch.ops.sgl_kernel.fused_add_rms_norm(
+    #         x,
+    #         residual,
+    #         weight,
+    #         variance_epsilon,
+    #     )
+    #     return x, residual
 
 
 @dataclass

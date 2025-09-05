@@ -3,11 +3,11 @@
 #include <torch/all.h>
 
 #ifndef USE_ROCM
-  #include <cuda_bf16.h>
-  #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #else
-  #include <hip/hip_bf16.h>
-  #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 
 using __nv_bfloat16 = __hip_bfloat16;
 using __nv_bfloat162 = __hip_bfloat162;
@@ -37,7 +37,9 @@ struct _typeConvert<c10::Half> {
   using hip_type = __half;
   using packed_hip_type = __half2;
 
-  __device__ static inline float convert(hip_type x) { return __half2float(x); }
+  __device__ static inline float convert(hip_type x) {
+    return __half2float(x);
+  }
   __device__ static inline float2 convert(packed_hip_type x) {
     return __half22float2(x);
   }
@@ -49,7 +51,7 @@ struct _typeConvert<c10::Half> {
   }
 };
 
-  #if defined(USE_ROCM) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+#if defined(USE_ROCM) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
 // CUDA_ARCH < 800 does not have BF16 support
 // TODO: Add in ROCm support once public headers handle bf16 maturely
 template <>
@@ -71,9 +73,9 @@ struct _typeConvert<c10::BFloat16> {
     return __float22bfloat162_rn(x);
   }
 };
-  #endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#endif    // defined(USE_ROCM) || (defined(CUDA_VERSION) && (CUDA_VERSION >=
-          // 12000))
+#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#endif  // defined(USE_ROCM) || (defined(CUDA_VERSION) && (CUDA_VERSION >=
+        // 12000))
 
 /* Vector POD struct to generate vectorized and packed FP16/BF16 ops
    for appropriate specializations of fused_add_rms_norm_kernel.
@@ -84,8 +86,7 @@ template <typename scalar_t, int width>
 struct alignas(16) _f16Vec {
   /* Not theoretically necessary that width is a power of 2 but should
      almost always be the case for optimization purposes */
-  static_assert(width > 0 && (width & (width - 1)) == 0,
-                "Width is not a positive power of 2!");
+  static_assert(width > 0 && (width & (width - 1)) == 0, "Width is not a positive power of 2!");
   using Converter = _typeConvert<scalar_t>;
   using T1 = typename Converter::hip_type;
   using T2 = typename Converter::packed_hip_type;
@@ -102,7 +103,8 @@ struct alignas(16) _f16Vec {
       }
     } else {
 #pragma unroll
-      for (int i = 0; i < width; ++i) data[i] += other.data[i];
+      for (int i = 0; i < width; ++i)
+        data[i] += other.data[i];
     }
     return *this;
   }
@@ -118,7 +120,8 @@ struct alignas(16) _f16Vec {
       }
     } else {
 #pragma unroll
-      for (int i = 0; i < width; ++i) data[i] *= other.data[i];
+      for (int i = 0; i < width; ++i)
+        data[i] *= other.data[i];
     }
     return *this;
   }

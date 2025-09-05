@@ -89,6 +89,8 @@ hipcc_flags = [
     "-DENABLE_BF16",
     "-DENABLE_FP8",
     fp8_macro,
+    "-U__HIP_NO_HALF_CONVERSIONS__",
+    "-U__HIP_NO_HALF_OPERATORS__",
 ]
 
 ext_modules = [
