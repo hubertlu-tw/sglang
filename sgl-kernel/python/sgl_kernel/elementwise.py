@@ -237,6 +237,32 @@ if torch.version.hip is not None:
         torch.ops.sgl_kernel.gelu_quick(out, input)
         return out
 
+    def rms_norm(
+        x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
+    ) -> torch.Tensor:
+        out = torch.empty_like(x)
+        torch.ops.sgl_kernel.rms_norm(
+            out,
+            x,
+            weight,
+            variance_epsilon,
+        )
+        return out
+
+    def fused_add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        torch.ops.sgl_kernel.fused_add_rms_norm(
+            x,
+            residual,
+            weight,
+            variance_epsilon,
+        )
+        return x, residual
+
 
 @dataclass
 class FusedSetKVBufferArg:

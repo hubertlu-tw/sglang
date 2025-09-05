@@ -35,6 +35,8 @@ from sgl_kernel.elementwise import (
 
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
+    from sgl_kernel.elementwise import rms_norm
+    from sgl_kernel.elementwise import hip_fused_add_rms_norm  # TODO (Hubert)
 
 from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
