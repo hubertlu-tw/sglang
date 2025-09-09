@@ -33,7 +33,9 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = (
+    get_bool_env_var("USE_AITER_RMSNORM") and _is_hip
+)  ##### TODO (Hubert): remove this later!
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
@@ -49,11 +51,7 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
-    from sgl_kernel import (  # def fused_add_rmsnorm(; x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,; variance_epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:; rms_norm(x: torch.Tensor, weight: torch.Tensor,; variance_epsilon: float) -> torch.Tensor:
-        fused_add_rmsnorm,
-        rms_norm,
-    )
-    from vllm._custom_ops import fused_add_rms_norm, rms_norm
+    from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 logger = logging.getLogger(__name__)
 
@@ -131,18 +129,11 @@ class RMSNorm(CustomOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            # fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = torch.empty_like(x)
-        rms_norm(out, x, self.weight.data, self.variance_epsilon)
+        rmsnorm(out, x, self.weight.data, self.variance_epsilon)
         return out
-
-    # def fused_add_rmsnorm(
-    #     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-    #     variance_epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
-    # rms_norm(x: torch.Tensor, weight: torch.Tensor,
-    #      variance_epsilon: float) -> torch.Tensor:
 
     def forward_native(
         self,
