@@ -24,7 +24,7 @@
 #include "dtype_float32.cuh"
 
 #ifdef USE_ROCM
-  #include <hip/hip_fp16.h>
+#include <hip/hip_fp16.h>
 #endif
 
 #include <stdint.h>
@@ -131,14 +131,12 @@ inline __device__ uint32_t float2_to_half2(float2 f) {
     uint16_t u16[2];
   } tmp;
 #ifndef USE_ROCM
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;\n"
-               : "=r"(tmp.u32)
-               : "f"(f.y), "f"(f.x));
-  #else
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;\n" : "=r"(tmp.u32) : "f"(f.y), "f"(f.x));
+#else
   asm volatile("cvt.rn.f16.f32 %0, %1;\n" : "=h"(tmp.u16[0]) : "f"(f.x));
   asm volatile("cvt.rn.f16.f32 %0, %1;\n" : "=h"(tmp.u16[1]) : "f"(f.y));
-  #endif
+#endif
 #else
   tmp.u16[0] = float_to_half(f.x);
   tmp.u16[1] = float_to_half(f.y);
@@ -331,13 +329,9 @@ inline __device__ Float8_ mul(uint16_t a, uint4 b) {
 inline __device__ uint32_t fma(uint32_t a, uint32_t b, uint32_t c) {
   uint32_t d;
 #ifndef USE_ROCM
-  asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
-               : "=r"(d)
-               : "r"(a), "r"(b), "r"(c));
+  asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
 #else
-  asm volatile("v_pk_fma_f16 %0, %1, %2, %3;\n"
-               : "=v"(d)
-               : "v"(a), "v"(b), "v"(c));
+  asm volatile("v_pk_fma_f16 %0, %1, %2, %3;\n" : "=v"(d) : "v"(a), "v"(b), "v"(c));
 #endif
   return d;
 }
@@ -478,9 +472,13 @@ inline __device__ void from_float(uint4& dst, Float8_ src) {
 }
 
 // From float16 to float32.
-inline __device__ float to_float(uint16_t u) { return half_to_float(u); }
+inline __device__ float to_float(uint16_t u) {
+  return half_to_float(u);
+}
 
-inline __device__ float2 to_float(uint32_t u) { return half2_to_float2(u); }
+inline __device__ float2 to_float(uint32_t u) {
+  return half2_to_float2(u);
+}
 
 inline __device__ Float4_ to_float(uint2 u) {
   Float4_ tmp;
@@ -499,6 +497,8 @@ inline __device__ Float8_ to_float(uint4 u) {
 }
 
 // Zero-out a variable.
-inline __device__ void zero(uint16_t& dst) { dst = uint16_t(0); }
+inline __device__ void zero(uint16_t& dst) {
+  dst = uint16_t(0);
+}
 
 }  // namespace sgl_hip

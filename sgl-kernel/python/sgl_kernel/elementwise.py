@@ -4,49 +4,46 @@ from typing import Optional
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
 
-
-# These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
-# Kudos to @yzh119
-def rmsnorm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-    out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = None,
-) -> torch.Tensor:
-    r"""Root mean square normalization.
-
-    ``out[i] = (input[i] / RMS(input)) * weight[i]``
-
-    Parameters
-    ----------
-    input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
-    eps: float
-        Epsilon for numerical stability.
-    out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
-    enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
-
-    Returns
-    -------
-    output: torch.Tensor
-        Normalized tensor, shape (batch_size, hidden_size).
-    """
-    if out is None:
-        out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
-    return out
-
-
 if torch.version.hip is None:
+    # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
+    # Kudos to @yzh119
+    def rmsnorm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        r"""Root mean square normalization.
+
+        ``out[i] = (input[i] / RMS(input)) * weight[i]``
+
+        Parameters
+        ----------
+        input: torch.Tensor
+            Input tensor, shape (batch_size, hidden_size).
+        weight: torch.Tensor
+            Weight tensor, shape (hidden_size,).
+        eps: float
+            Epsilon for numerical stability.
+        out: Optional[torch.Tensor]
+            The output tensor, if specified, the kernel will update this tensor inplace.
+        enable_pdl: Optional[bool]
+            Whether to enable `programmatic dependent launch
+            <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+            If None, will be automatically enabled on Hopper architecture.
+
+        Returns
+        -------
+        output: torch.Tensor
+            Normalized tensor, shape (batch_size, hidden_size).
+        """
+        if out is None:
+            out = torch.empty_like(input)
+        if enable_pdl is None:
+            enable_pdl = is_arch_support_pdl()
+        torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
+        return out
 
     def fused_add_rmsnorm(
         input: torch.Tensor,
@@ -86,6 +83,12 @@ if torch.version.hip is None:
 
 else:
 
+    def rmsnorm(
+        out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
+    ) -> None:
+        input_contiguous = input.contiguous()
+        torch.ops.sgl_kernel.rmsnorm.default(out, input_contiguous, weight, epsilon)
+
     def fused_add_rmsnorm(
         # def fused_add_rms_norm(
         input: torch.Tensor,
@@ -93,9 +96,7 @@ else:
         weight: torch.Tensor,
         epsilon: float,
     ) -> None:
-        torch.ops.sgl_kernel.fused_add_rms_norm.default(
-            input, residual, weight, epsilon
-        )
+        torch.ops.sgl_kernel.fused_add_rmsnorm.default(input, residual, weight, epsilon)
 
 
 def gemma_rmsnorm(
@@ -251,23 +252,6 @@ if torch.version.hip is not None:
 
         torch.ops.sgl_kernel.gelu_quick.default(out, input)
         return out
-
-    def rms_norm(
-        out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
-    ) -> None:
-        input_contiguous = input.contiguous()
-        torch.ops.sgl_kernel.rms_norm.default(out, input_contiguous, weight, epsilon)
-
-    # def fused_add_rms_norm(
-    #         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-    #         variance_epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
-    #     torch.ops.sgl_kernel.fused_add_rms_norm(
-    #         x,
-    #         residual,
-    #         weight,
-    #         variance_epsilon,
-    #     )
-    #     return x, residual
 
 
 @dataclass

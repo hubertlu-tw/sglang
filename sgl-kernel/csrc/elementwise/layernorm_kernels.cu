@@ -4,7 +4,7 @@
 #include <hipcub/hipcub.hpp>
 
 #include "hip/dispatch_utils.h"
-#include "hip/quant_utils.cuh"  // TODO (Hubert): do we actually need this?
+#include "hip/quant_utils.cuh"
 #include "hip/type_convert.cuh"
 
 namespace sgl_hip {
@@ -214,7 +214,7 @@ struct Vec<c10::BFloat16, 8> {
         vec_hidden_size);                                                       \
   });
 
-void rms_norm(
+void rmsnorm(
     torch::Tensor& out,     // [..., hidden_size]
     torch::Tensor& input,   // [..., hidden_size]
     torch::Tensor& weight,  // [hidden_size]
@@ -252,7 +252,7 @@ void rms_norm(
         hidden_size);                                                                     \
   });
 
-void fused_add_rms_norm(
+void sgl_fused_add_rmsnorm(
     torch::Tensor& input,     // [..., hidden_size]
     torch::Tensor& residual,  // [..., hidden_size]
     torch::Tensor& weight,    // [hidden_size]

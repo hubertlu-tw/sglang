@@ -20,9 +20,9 @@
  */
 #pragma once
 
-#include "attention_generic.cuh"
-
 #include <stdint.h>
+
+#include "attention_generic.cuh"
 
 namespace sgl_hip {
 
@@ -68,7 +68,9 @@ struct FloatVec<float4> {
 };
 
 // Vector addition.
-inline __device__ float add(float a, float b) { return a + b; }
+inline __device__ float add(float a, float b) {
+  return a + b;
+}
 
 inline __device__ float2 add(float2 a, float2 b) {
   float2 c;
@@ -129,7 +131,9 @@ inline __device__ float4 mul(float a, float4 b) {
 }
 
 // Vector fused multiply-add.
-inline __device__ float fma(float a, float b, float c) { return a * b + c; }
+inline __device__ float fma(float a, float b, float c) {
+  return a * b + c;
+}
 
 inline __device__ float2 fma(float2 a, float2 b, float2 c) {
   float2 d;
@@ -206,7 +210,9 @@ inline __device__ float sum(Float8_ v) {
 }
 
 // Vector dot product.
-inline __device__ float dot(float a, float b) { return a * b; }
+inline __device__ float dot(float a, float b) {
+  return a * b;
+}
 
 inline __device__ float dot(float2 a, float2 b) {
   float2 c = mul<float2, float2, float2>(a, b);
@@ -228,24 +234,42 @@ inline __device__ float dot(Float8_ a, Float8_ b) {
 }
 
 // From float to float.
-inline __device__ void from_float(float& dst, float src) { dst = src; }
+inline __device__ void from_float(float& dst, float src) {
+  dst = src;
+}
 
-inline __device__ void from_float(float2& dst, float2 src) { dst = src; }
+inline __device__ void from_float(float2& dst, float2 src) {
+  dst = src;
+}
 
-inline __device__ void from_float(float4& dst, float4 src) { dst = src; }
+inline __device__ void from_float(float4& dst, float4 src) {
+  dst = src;
+}
 
 // From float to float.
-inline __device__ float to_float(float u) { return u; }
+inline __device__ float to_float(float u) {
+  return u;
+}
 
-inline __device__ float2 to_float(float2 u) { return u; }
+inline __device__ float2 to_float(float2 u) {
+  return u;
+}
 
-inline __device__ float4 to_float(float4 u) { return u; }
+inline __device__ float4 to_float(float4 u) {
+  return u;
+}
 
-inline __device__ Float4_ to_float(Float4_ u) { return u; }
+inline __device__ Float4_ to_float(Float4_ u) {
+  return u;
+}
 
-inline __device__ Float8_ to_float(Float8_ u) { return u; }
+inline __device__ Float8_ to_float(Float8_ u) {
+  return u;
+}
 
 // Zero-out a variable.
-inline __device__ void zero(float& dst) { dst = 0.f; }
+inline __device__ void zero(float& dst) {
+  dst = 0.f;
+}
 
 }  // namespace sgl_hip

@@ -37,15 +37,15 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   // Layernorm
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   m.def(
-      "rms_norm(Tensor! result, Tensor input, Tensor weight, float epsilon) -> "
+      "rmsnorm(Tensor! result, Tensor input, Tensor weight, float epsilon) -> "
       "()");
-  m.impl("rms_norm", torch::kCUDA, &rms_norm);
+  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
 
   // In-place fused Add and RMS Normalization.
   m.def(
-      "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
+      "fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, "
       "float epsilon) -> ()");
-  m.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
+  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
 
   /*
    * From csrc/allreduce

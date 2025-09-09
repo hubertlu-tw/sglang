@@ -134,19 +134,19 @@ int64_t cutlass_mla_get_workspace_size(
 /*
  * From csrc/elementwise
  */
+#ifdef USE_ROCM
+void rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double epsilon);
+void sgl_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon);
+#else
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
+#endif
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
-
-#ifdef USE_ROCM
-void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double epsilon);
-void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon);
-#endif
 
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,

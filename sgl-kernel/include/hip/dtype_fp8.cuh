@@ -1,13 +1,13 @@
 #pragma once
 
-#include "attention_generic.cuh"
-
 #include <stdint.h>
+
+#include "attention_generic.cuh"
 #ifdef ENABLE_FP8
-  #ifndef USE_ROCM
-    #include <cuda_fp8.h>
-  #endif  // USE_ROCM
-#endif    // ENABLE_FP8
+#ifndef USE_ROCM
+#include <cuda_fp8.h>
+#endif  // USE_ROCM
+#endif  // ENABLE_FP8
 
 namespace sgl_hip {
 
