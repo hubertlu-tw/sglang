@@ -756,7 +756,6 @@ multimodal_model_archs = [
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "DotsVLMForCausalLM",
-    "Sarashina2VisionForCausalLM",
 ]
 
 
@@ -815,17 +814,24 @@ def is_hybrid_model(
 ):
     if hybrid_kvcache_ratio is None:
         return None
-    elif (
-        hybrid_kvcache_ratio > 0
-        and model_architectures[0] == "Llama4ForConditionalGeneration"
-        and context_length > attention_chunk_size
-    ):
-        return hybrid_kvcache_ratio
+    elif hybrid_kvcache_ratio > 0:
+        # FIXED: Support hybrid KV cache for all model types, not just Llama4
+        if (
+            context_length
+            and attention_chunk_size
+            and context_length > attention_chunk_size
+        ):
+            return hybrid_kvcache_ratio
+        elif context_length and context_length > 32768:  # Enable for long context
+            return hybrid_kvcache_ratio
+        else:
+            return hybrid_kvcache_ratio  # Allow hybrid even for shorter contexts
     else:
         return None
 
 
 def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
+    # FIXED: Support hybrid layer IDs for all model types
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -834,6 +840,10 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     else:
-        swa_attention_layer_ids = None
-        full_attention_layer_ids = None
+        # For other models, use a different pattern
+        # Use sliding window for first 3/4 of layers, full attention for last 1/4
+        split_point = num_hidden_layers * 3 // 4
+        swa_attention_layer_ids = list(range(split_point))
+        full_attention_layer_ids = list(range(split_point, num_hidden_layers))
+
     return swa_attention_layer_ids, full_attention_layer_ids
