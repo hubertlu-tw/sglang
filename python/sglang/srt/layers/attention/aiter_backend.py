@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 """
-Memory-safe AIter backend with proper hybrid KV cache support
+AIter attention backend with hybrid KV cache support for LLaMA 4.
+
+This backend provides end-to-end attention solution using AIter kernels
+with support for hybrid KV caching as described in SGLang PR #6563.
 """
 
 import math
@@ -62,10 +65,18 @@ class ForwardMetadata:
 
 
 global_workspace_buffer = None
+
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
 class AiterAttnBackend(AttentionBackend):
+    """
+    AIter attention backend with hybrid KV cache support.
+
+    Supports hybrid KV caching for LLaMA 4 models, where different layers
+    use different attention patterns (sliding window vs full attention).
+    """
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -73,7 +84,8 @@ class AiterAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-        # Lazy import to avoid the initialization of cuda context
+
+        # Initialize extend attention function
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
         )
@@ -82,67 +94,10 @@ class AiterAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
 
-        # FIXED: Proper hybrid KV cache configuration
-        self.is_hybrid = getattr(model_runner, "is_hybrid", False)
-        self.hybrid_kvcache_ratio = (
-            getattr(model_runner.server_args, "hybrid_kvcache_ratio", None) or 0.0
-        )
+        # Initialize hybrid KV cache support
+        self._init_hybrid_cache_support(model_runner)
 
-        # Enable hybrid if ratio is specified
-        if self.hybrid_kvcache_ratio > 0:
-            self.is_hybrid = True
-            print(
-                f"[AIter Backend] Enabling hybrid KV cache with ratio: {self.hybrid_kvcache_ratio}"
-            )
-
-        # Get token pools and layer mappings
-        token2pool = getattr(model_runner, "token_to_kv_pool", None)
-        self.full_to_swa_index_mapping = getattr(
-            token2pool, "full_to_swa_index_mapping", None
-        )
-        self.swa_layer_ids = (
-            getattr(model_runner.model_config, "swa_attention_layer_ids", []) or []
-        )
-        self.full_layer_ids = (
-            getattr(model_runner.model_config, "full_attention_layer_ids", []) or []
-        )
-
-        # FIXED: Calculate memory limits based on hybrid ratio and available GPU memory
-        try:
-            if torch.cuda.is_available():
-                total_memory = torch.cuda.get_device_properties(
-                    self.device
-                ).total_memory
-                # Use at most 80% of GPU memory for KV cache
-                available_memory = int(total_memory * 0.8)
-                print(
-                    f"[AIter Backend] Available GPU memory for KV cache: {available_memory / 1024**3:.2f} GB"
-                )
-            else:
-                available_memory = 8 * 1024**3  # 8GB fallback
-        except:
-            available_memory = 8 * 1024**3  # 8GB fallback
-
-        self.max_total_num_tokens = model_runner.max_total_num_tokens
-
-        # Calculate effective memory usage based on hybrid ratio
-        if self.is_hybrid and self.hybrid_kvcache_ratio > 0:
-            # Reduce GPU memory allocation based on hybrid ratio
-            memory_reduction_factor = 1.0 - (
-                self.hybrid_kvcache_ratio * 0.6
-            )  # Up to 60% reduction
-            self.effective_tokens = int(
-                self.max_total_num_tokens * memory_reduction_factor
-            )
-            self.cpu_fallback_tokens = self.max_total_num_tokens - self.effective_tokens
-
-            print(
-                f"[AIter Backend] Hybrid config - GPU tokens: {self.effective_tokens}, CPU fallback: {self.cpu_fallback_tokens}"
-            )
-        else:
-            self.effective_tokens = self.max_total_num_tokens
-            self.cpu_fallback_tokens = 0
-
+        # Initialize model configuration
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
@@ -165,6 +120,7 @@ class AiterAttnBackend(AttentionBackend):
 
         max_bs = model_runner.req_to_token_pool.size
 
+        # Initialize index pointers
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -189,75 +145,10 @@ class AiterAttnBackend(AttentionBackend):
                     model_runner, self
                 )
 
-        # FIXED: Memory-safe workspace buffer allocation
-        self.max_num_partitions = (
-            self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
-        ) // _AITER_PARTITION_SIZE_ROCM
+        # Initialize AIter kernel workspace
+        self._init_aiter_workspace(max_bs)
 
-        nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
-
-        if not self.use_mla:
-            # Calculate safe workspace buffer size
-            base_size = max_bs * self.num_head * self.max_num_partitions * self.head_dim
-
-            # Apply memory reduction for hybrid caching
-            if self.is_hybrid and self.hybrid_kvcache_ratio > 0:
-                reduction_factor = 1.0 - (self.hybrid_kvcache_ratio * 0.5)
-                base_size = int(base_size * reduction_factor)
-                print(
-                    f"[AIter Backend] Reduced workspace size by {self.hybrid_kvcache_ratio * 50:.1f}% for hybrid caching"
-                )
-
-            # Ensure we don't exceed available memory
-            max_safe_size = available_memory // (4 * nbyes_per_qo_elem)  # Safety margin
-            base_size = min(base_size, max_safe_size)
-
-            try:
-                self.workspace_buffer = torch.empty(
-                    base_size * nbyes_per_qo_elem
-                    + 2 * (base_size // self.head_dim) * 4,
-                    dtype=torch.uint8,
-                    device=self.device,
-                )
-                print(
-                    f"[AIter Backend] Allocated workspace buffer: {self.workspace_buffer.numel() / 1024**2:.1f} MB"
-                )
-            except RuntimeError as e:
-                # If allocation fails, try with even smaller size
-                base_size = base_size // 2
-                print(
-                    f"[AIter Backend] Allocation failed, trying smaller size: {base_size}"
-                )
-                self.workspace_buffer = torch.empty(
-                    base_size * nbyes_per_qo_elem
-                    + 2 * (base_size // self.head_dim) * 4,
-                    dtype=torch.uint8,
-                    device=self.device,
-                )
-
-            # ADDED: CPU fallback workspace for extreme cases
-            if self.is_hybrid and self.hybrid_kvcache_ratio > 0.5:
-                try:
-                    cpu_workspace_size = int(
-                        base_size * self.hybrid_kvcache_ratio * 0.3
-                    )
-                    self.cpu_workspace_buffer = torch.empty(
-                        cpu_workspace_size * nbyes_per_qo_elem,
-                        dtype=torch.uint8,
-                        device="cpu",
-                        pin_memory=True,
-                    )
-                    print(
-                        f"[AIter Backend] Allocated CPU fallback workspace: {self.cpu_workspace_buffer.numel() / 1024**2:.1f} MB"
-                    )
-                except:
-                    print(
-                        "[AIter Backend] Could not allocate CPU workspace, using GPU-only"
-                    )
-                    self.cpu_workspace_buffer = None
-            else:
-                self.cpu_workspace_buffer = None
-
+        # Initialize attention scaling
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
             self.device
@@ -272,41 +163,84 @@ class AiterAttnBackend(AttentionBackend):
             )
             self.enable_dp_attention = is_dp_attention_enabled()
 
-    def _should_use_cpu_fallback(self, current_memory_usage: int) -> bool:
-        """Determine if we should use CPU fallback based on memory pressure."""
-        if not self.is_hybrid or self.hybrid_kvcache_ratio <= 0:
-            return False
+    def _init_hybrid_cache_support(self, model_runner: ModelRunner) -> None:
+        """
+        Initialize hybrid KV cache support for LLaMA 4 models.
 
-        try:
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated(self.device)
-                reserved = torch.cuda.memory_reserved(self.device)
-                total = torch.cuda.get_device_properties(self.device).total_memory
+        This follows the same pattern as FlashAttention backend for consistency.
+        For non-hybrid models, all attributes are set to safe defaults.
+        """
+        self.is_hybrid: bool = getattr(model_runner, "is_hybrid", False)
 
-                memory_pressure = allocated / total
+        if self.is_hybrid:
+            # Initialize hybrid cache components
+            self.full_to_swa_index_mapping = getattr(
+                model_runner.token_to_kv_pool, "full_to_swa_index_mapping", None
+            )
+            self.swa_layer_ids = (
+                getattr(model_runner.model_config, "swa_attention_layer_ids", []) or []
+            )
+            self.full_layer_ids = (
+                getattr(model_runner.model_config, "full_attention_layer_ids", []) or []
+            )
+        else:
+            # Set safe defaults for non-hybrid models
+            self.full_to_swa_index_mapping = None
+            self.swa_layer_ids = []
+            self.full_layer_ids = []
 
-                # Use CPU fallback if memory pressure is high
-                return memory_pressure > (1.0 - self.hybrid_kvcache_ratio * 0.5)
-        except:
-            pass
+    def _init_aiter_workspace(self, max_bs: int) -> None:
+        """Initialize AIter kernel workspace buffer."""
+        self.max_num_partitions = (
+            self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+        ) // _AITER_PARTITION_SIZE_ROCM
 
-        # Fallback based on token count
-        return current_memory_usage > self.effective_tokens
+        nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-    # Map indices from the FULL KV pool to the SWA pool when this layer uses sliding-window attention.
+        if not self.use_mla:
+            workspace_size = (
+                max_bs * self.num_head * self.max_num_partitions * self.head_dim
+            ) * nbyes_per_qo_elem + 2 * (
+                max_bs * self.num_head * self.max_num_partitions
+            ) * 4
+
+            self.workspace_buffer = torch.empty(
+                workspace_size,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+
     def _map_cache_loc_for_layer(
         self, layer_id: int, cache_loc: torch.Tensor
     ) -> torch.Tensor:
-        if (not self.is_hybrid) or (self.full_to_swa_index_mapping is None):
+        """
+        Map cache locations for hybrid KV cache layers.
+
+        For LLaMA 4 models with hybrid cache:
+        - SWA layers: Map from full pool to SWA pool using index mapping
+        - Full layers: Use original cache location
+
+        For all other models: Always use original cache location (no-op).
+
+        Args:
+            layer_id: Layer identifier to determine cache routing
+            cache_loc: Original cache location tensor
+
+        Returns:
+            Mapped cache location tensor
+        """
+        if not self.is_hybrid or self.full_to_swa_index_mapping is None:
             return cache_loc
+
         if layer_id in self.swa_layer_ids:
-            # mapping is 1D tensor: new_idx = mapping[old_idx]
+            # Map to SWA (local) cache for sliding window attention layers
             return self.full_to_swa_index_mapping[cache_loc]
-        return cache_loc
+        else:
+            # Use global cache for full attention layers
+            return cache_loc
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init auxiliary variables for triton attention backend."""
-
+        """Initialize auxiliary variables for attention computation."""
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
@@ -314,57 +248,22 @@ class AiterAttnBackend(AttentionBackend):
         kv_last_page_len = None
         max_q_len = None
 
-        # ADDED: Check memory pressure and adjust batch size if needed
-        current_tokens = forward_batch.seq_lens_sum
-        if self._should_use_cpu_fallback(current_tokens):
-            print(
-                f"[AIter Backend] High memory pressure detected for {current_tokens} tokens, using fallback strategies"
-            )
-
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-
-                # FIXED: Safe allocation with bounds checking
-                try:
-                    kv_indices = torch.empty(
-                        forward_batch.seq_lens_sum,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    create_flashinfer_kv_indices_triton[(bs,)](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                    )
-                except RuntimeError as e:
-                    print(f"[AIter Backend] Memory allocation failed: {e}")
-                    # Try with smaller allocation
-                    reduced_size = min(
-                        forward_batch.seq_lens_sum, self.effective_tokens
-                    )
-                    kv_indices = torch.empty(
-                        reduced_size, dtype=torch.int32, device=self.device
-                    )
-                    # Truncate sequences if needed
-                    truncated_seq_lens = torch.clamp(
-                        forward_batch.seq_lens, max=reduced_size // bs
-                    )
-                    kv_indptr[1 : bs + 1] = torch.cumsum(truncated_seq_lens, dim=0)
-                    create_flashinfer_kv_indices_triton[(bs,)](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        truncated_seq_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                    )
+                kv_indices = torch.empty(
+                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
@@ -384,7 +283,6 @@ class AiterAttnBackend(AttentionBackend):
                 None,
             )
 
-        # ... [Include rest of the method with similar safety checks] ...
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
@@ -476,6 +374,42 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
+        elif forward_batch.forward_mode.is_draft_extend():
+            num_tokens_per_bs = self.speculative_num_steps + 1
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                step=num_tokens_per_bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+            kv_indices = torch.empty(
+                forward_batch.seq_lens_sum,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.kv_last_page_len[:bs]
+            max_q_len = num_tokens_per_bs
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                None,
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -528,57 +462,238 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        """Initialize CUDA graph state buffers."""
         self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
-
-        # FIXED: Safe CUDA graph buffer allocation
         if kv_indices_buf is None:
-            # Reduce buffer size for hybrid caching
-            effective_context_len = self.max_context_len
-            if self.is_hybrid and self.hybrid_kvcache_ratio > 0:
-                effective_context_len = int(
-                    self.max_context_len * (1.0 - self.hybrid_kvcache_ratio * 0.4)
-                )
-
-            buffer_size = max_bs * effective_context_len
-
-            try:
-                self.cuda_graph_kv_indices = torch.zeros(
-                    buffer_size, dtype=torch.int32, device=self.device
-                )
-            except RuntimeError:
-                # Try with smaller buffer
-                buffer_size = buffer_size // 2
-                print(
-                    f"[AIter Backend] Reducing CUDA graph buffer size to {buffer_size}"
-                )
-                self.cuda_graph_kv_indices = torch.zeros(
-                    buffer_size, dtype=torch.int32, device=self.device
-                )
+            self.cuda_graph_kv_indices = torch.zeros(
+                (max_bs * self.max_context_len),
+                dtype=torch.int32,
+                device=self.device,
+            )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
         if not self.skip_prefill:
-            # Reduce custom mask size for hybrid caching
-            effective_num_tokens = max_num_tokens
-            if self.is_hybrid and self.hybrid_kvcache_ratio > 0:
-                effective_num_tokens = int(
-                    max_num_tokens * (1.0 - self.hybrid_kvcache_ratio * 0.3)
-                )
+            self.cuda_graph_custom_mask = torch.zeros(
+                (max_num_tokens * self.max_context_len),
+                dtype=torch.uint8,
+                device=self.device,
+            )
 
-            mask_size = effective_num_tokens * self.max_context_len
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+    ):
+        """Initialize forward metadata during CUDA graph capture."""
+        if forward_mode.is_decode_or_idle():
+            qo_indptr = None
+            kv_last_page_len = None
+            max_q_len = None
 
-            try:
-                self.cuda_graph_custom_mask = torch.zeros(
-                    mask_size, dtype=torch.uint8, device=self.device
+            if spec_info is None:
+                kv_indptr = self.kv_indptr
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
-            except RuntimeError:
-                mask_size = mask_size // 2
-                print(f"[AIter Backend] Reducing custom mask size to {mask_size}")
-                self.cuda_graph_custom_mask = torch.zeros(
-                    mask_size, dtype=torch.uint8, device=self.device
-                )
+            else:
+                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
-    # ... [Include all other methods from the original with safety improvements] ...
+            if self.use_mla:
+                qo_indptr = self.qo_indptr_[: bs + 1]
+                qo_indptr[1 : bs + 1] = torch.cumsum(
+                    self.cuda_graph_kv_last_page_len[:bs], dim=0
+                )
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = 1
+
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                None,
+            )
+
+        elif forward_mode.is_target_verify():
+            if self.use_mla:
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * self.num_draft_tokens,
+                    step=self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = self.num_draft_tokens
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    None,
+                )
+            else:
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
+        elif forward_mode.is_draft_extend():
+            num_tokens_per_bs = self.speculative_num_steps + 1
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                step=num_tokens_per_bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = num_tokens_per_bs
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                None,
+            )
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        """Initialize forward metadata during CUDA graph replay."""
+        if forward_mode.is_decode_or_idle():
+            kv_indptr = self.kv_indptr
+            kv_indices = self.cuda_graph_kv_indices
+            if spec_info is None:
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+            else:
+                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
+                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+
+        elif forward_mode.is_target_verify():
+            bs = len(req_pool_indices)
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * self.num_draft_tokens,
+                step=self.num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_lens = seq_lens + self.num_draft_tokens
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+        elif forward_mode.is_draft_extend():
+            seq_lens = seq_lens[:bs]
+            accept_lens = spec_info.accept_length[:bs]
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+        else:
+            raise ValueError("Invalid forward mode")
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        """Get the fill value for CUDA graph sequence lengths."""
+        return 1
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -588,26 +703,20 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        """Forward pass for extend mode with hybrid cache support."""
+        # Apply cache location mapping for hybrid models
         cache_loc = (
             self._map_cache_loc_for_layer(layer.layer_id, forward_batch.out_cache_loc)
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
 
+        # Validate cache location tensor
         assert cache_loc.dtype in (torch.int32, torch.int64)
         if not get_is_capture_mode():
             assert cache_loc.min().item() >= 0
 
         self.logits_soft_cap = layer.logit_cap
-
-        # ADDED: Memory pressure monitoring
-        current_tokens = forward_batch.seq_lens_sum
-        use_cpu_fallback = self._should_use_cpu_fallback(current_tokens)
-
-        if use_cpu_fallback:
-            print(
-                f"[AIter Backend] Using memory optimization for {current_tokens} tokens"
-            )
 
         if k is not None:
             assert v is not None
@@ -620,7 +729,6 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
         if self.use_mla:
-            # MLA forward logic (same as before but with error handling)
             max_q_len = self.forward_metadata.max_q_len
             max_kv_len = self.forward_metadata.max_kv_len
             kv_indptr = self.forward_metadata.kv_indptr
@@ -733,6 +841,10 @@ class AiterAttnBackend(AttentionBackend):
                 return o
             elif forward_batch.forward_mode.is_draft_extend():
                 o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+                causal = True
+                sliding_window_size = -1
+                kv_indptr = self.forward_metadata.kv_indptr
+                kv_indices = self.forward_metadata.kv_indices
                 mla_prefill_fwd(
                     q,
                     K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -758,26 +870,21 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            try:
-                o = mha_batch_prefill_func(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache,
-                    v_cache,
-                    self.qo_indptr[:bs0],
-                    self.forward_metadata.kv_indptr[:bs0],
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.max_q_len,
-                    self.forward_metadata.max_kv_len,
-                    causal=True,
-                    logits_soft_cap=self.logits_soft_cap,
-                    alibi_slopes=None,
-                    return_lse=False,
-                    return_attn_probs=False,
-                )
-            except RuntimeError as e:
-                print(f"[AIter Backend] MHA batch prefill failed: {e}, trying fallback")
-                # Fallback to smaller batch or different approach
-                raise e
+            o = mha_batch_prefill_func(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache,
+                v_cache,
+                self.qo_indptr[:bs0],
+                self.forward_metadata.kv_indptr[:bs0],
+                self.forward_metadata.kv_indices,
+                self.forward_metadata.max_q_len,
+                self.forward_metadata.max_kv_len,
+                causal=True,
+                logits_soft_cap=self.logits_soft_cap,
+                alibi_slopes=None,
+                return_lse=False,
+                return_attn_probs=False,
+            )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -790,10 +897,13 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        """Forward pass for decode mode with hybrid cache support."""
+        # Apply cache location mapping for hybrid models
         cache_loc = self._map_cache_loc_for_layer(
             layer.layer_id, forward_batch.out_cache_loc
         )
 
+        # Validate cache location tensor
         assert cache_loc.dtype in (torch.int32, torch.int64)
         if not get_is_capture_mode():
             assert cache_loc.min().item() >= 0
@@ -807,10 +917,6 @@ class AiterAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-
-        # Check memory pressure
-        current_tokens = forward_batch.seq_lens_sum
-        use_cpu_fallback = self._should_use_cpu_fallback(current_tokens)
 
         if self.use_mla:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -830,13 +936,6 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.logits_soft_cap = layer.logit_cap
 
-            # Adjust partitions based on memory pressure
-            effective_partitions = self.max_num_partitions
-            if use_cpu_fallback:
-                effective_partitions = int(
-                    self.max_num_partitions * (1.0 - self.hybrid_kvcache_ratio * 0.3)
-                )
-
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 self.workspace_buffer,
@@ -852,7 +951,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.kv_indices,
                 self.kv_last_page_len,
                 1,
-                effective_partitions,
+                self.max_num_partitions,
                 None,
                 "auto",
                 "NHD",
@@ -865,99 +964,12 @@ class AiterAttnBackend(AttentionBackend):
 
         return o
 
-    # Include the remaining methods (init_forward_metadata_capture_cuda_graph, etc.)
-    # with similar safety improvements...
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
-    ):
-        if forward_mode.is_decode_or_idle():
-            qo_indptr = None
-            kv_last_page_len = None
-            max_q_len = None
-
-            if spec_info is None:
-                kv_indptr = self.kv_indptr
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-            else:
-                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-
-            if self.use_mla:
-                qo_indptr = self.qo_indptr_[: bs + 1]
-                qo_indptr[1 : bs + 1] = torch.cumsum(
-                    self.cuda_graph_kv_last_page_len[:bs], dim=0
-                )
-                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-                max_q_len = 1
-
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                None,
-            )
-        else:
-            raise ValueError(f"Invalid mode: {forward_mode=}")
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        if forward_mode.is_decode_or_idle():
-            kv_indptr = self.kv_indptr
-            kv_indices = self.cuda_graph_kv_indices
-            if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-            else:
-                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
-                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
-        else:
-            raise ValueError("Invalid forward mode")
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
-
-
-# Include the original helper classes with minimal changes
 class AiterIndicesUpdaterPrefill:
+    """Prefill indices updater for AIter backend."""
+
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
+        # Parse constants
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -970,6 +982,7 @@ class AiterIndicesUpdaterPrefill:
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
 
+        # Initialize buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
@@ -989,6 +1002,7 @@ class AiterIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        """Update method signature for type checking."""
         raise NotImplementedError()
 
     def update_single_wrapper(
@@ -1000,6 +1014,7 @@ class AiterIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        """Update prefill indices for single wrapper mode."""
         kv_start_idx = None
         kv_indptr = self.kv_indptr
         qo_indptr = self.qo_indptr
@@ -1008,9 +1023,12 @@ class AiterIndicesUpdaterPrefill:
 
         bs = len(req_pool_indices)
         if spec_info is None:
+            # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 
+            # Workaround for CI test compatibility
+            # Ensure sufficient buffer size to prevent NaN values during CUDA graph capture
             kv_indices = torch.empty(
                 paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
@@ -1050,6 +1068,8 @@ class AiterIndicesUpdaterPrefill:
 
 
 class AiterMlaIndicesUpdaterPrefill:
+    """MLA indices updater for AIter backend."""
+
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         self.attn_backend = attn_backend
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -1072,6 +1092,7 @@ class AiterMlaIndicesUpdaterPrefill:
         max_kv_len: int,
         spec_info: Optional[SpecInfo],
     ):
+        """Update method signature for type checking."""
         raise NotImplementedError()
 
     def update_single_wrapper(
@@ -1084,11 +1105,12 @@ class AiterMlaIndicesUpdaterPrefill:
         max_kv_len: int,
         spec_info: Optional[SpecInfo],
     ):
+        """Update MLA indices for single wrapper mode."""
         bs = len(req_pool_indices)
-
         kv_indptr = self.attn_backend.kv_indptr
 
         if spec_info is None:
+            # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
@@ -1127,6 +1149,12 @@ class AiterMlaIndicesUpdaterPrefill:
 
 
 class AiterMultiStepDraftBackend:
+    """
+    Multi-step draft backend for speculative decoding.
+
+    Wraps multiple AIter attention backends for consecutive draft decoding steps.
+    """
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1161,8 +1189,110 @@ class AiterMultiStepDraftBackend:
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.device = model_runner.device
+
+        # Cached variables for draft decode KV indices generation
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
         assert self.page_size == 1, "Page size must be 1"
 
-    # ... [Include remaining methods]
+    def common_template(
+        self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
+    ):
+        """Common template for multi-step operations."""
+        num_seqs = forward_batch.batch_size
+        bs = self.topk * num_seqs
+        seq_lens_sum = forward_batch.seq_lens_sum
+
+        self.generate_draft_decode_kv_indices[
+            (self.speculative_num_steps, num_seqs, self.topk)
+        ](
+            forward_batch.req_pool_indices,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.seq_lens,
+            kv_indices_buffer,
+            self.kv_indptr,
+            forward_batch.positions,
+            self.pool_len,
+            kv_indices_buffer.shape[1],
+            self.kv_indptr.shape[1],
+            triton.next_power_of_2(num_seqs),
+            triton.next_power_of_2(self.speculative_num_steps),
+            triton.next_power_of_2(bs),
+            self.page_size,
+        )
+
+        for i in range(self.speculative_num_steps):
+            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                : seq_lens_sum * self.topk + bs * (i + 1)
+            ]
+            call_fn(i, forward_batch)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Initialize forward metadata for multi-step draft backend."""
+        kv_indices = torch.empty(
+            (
+                self.speculative_num_steps,
+                forward_batch.batch_size * self.topk * self.max_context_len,
+            ),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        def call_fn(i, forward_batch):
+            forward_batch.spec_info.kv_indptr = (
+                forward_batch.spec_info.kv_indptr.clone()
+            )
+            forward_batch.spec_info.kv_indices = (
+                forward_batch.spec_info.kv_indices.clone()
+            )
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+        self.common_template(forward_batch, kv_indices, call_fn)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Initialize CUDA graph state for multi-step draft backend."""
+        self.cuda_graph_kv_indices = torch.zeros(
+            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i].init_cuda_graph_state(
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+            )
+
+    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        """Initialize forward metadata during CUDA graph capture."""
+
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.batch_size * self.topk,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+            )
+
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        """Initialize forward metadata during CUDA graph replay."""
+
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                seq_lens_sum=-1,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=None,
+            )
+
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
