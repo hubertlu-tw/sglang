@@ -14,7 +14,7 @@ fi
 # Install the required dependencies in CI.
 docker exec ci_sglang pip install --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
-docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+docker exec ci_sglang pip install -i https://test.pypi.org/simple/ sgl-kernel
 
 case "${GPU_ARCH}" in
   mi35x)
