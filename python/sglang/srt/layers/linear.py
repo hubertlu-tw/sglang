@@ -34,6 +34,33 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu, is_npu, set_weight_attrs
 
+# Lazy import for iris integration
+_iris_matmul_integration = None
+
+
+def _get_iris_integration():
+    """Lazy import of iris integration to avoid issues at module load time."""
+    global _iris_matmul_integration
+    if _iris_matmul_integration is None:
+        try:
+            from sglang.srt.layers.iris_matmul import (
+                IrisMatMulLayer,
+                should_use_iris_matmul,
+            )
+
+            _iris_matmul_integration = {
+                "IrisMatMulLayer": IrisMatMulLayer,
+                "should_use_iris_matmul": should_use_iris_matmul,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to import iris integration: {e}")
+            _iris_matmul_integration = {
+                "IrisMatMulLayer": None,
+                "should_use_iris_matmul": lambda: False,
+            }
+    return _iris_matmul_integration
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
         QuantizationConfig,
@@ -1268,6 +1295,31 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
+        # Initialize iris matmul layer if enabled
+        self.iris_matmul_layer = None
+        iris_integration = _get_iris_integration()
+        if (
+            iris_integration["should_use_iris_matmul"]()
+            and iris_integration["IrisMatMulLayer"] is not None
+        ):
+            try:
+                from sglang.srt.layers.iris_matmul import get_iris_shmem
+
+                device = torch.cuda.current_device()
+                iris_shmem = get_iris_shmem()
+                self.iris_matmul_layer = iris_integration["IrisMatMulLayer"](
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    dtype=self.params_dtype or torch.float16,
+                    device=device,
+                    name=f"{prefix}.iris_matmul" if prefix else "iris_matmul",
+                    iris_shmem=iris_shmem,
+                )
+                logger.info(f"Initialized iris matmul for {prefix}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize iris matmul for {prefix}: {e}")
+                self.iris_matmul_layer = None
+
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -1359,7 +1411,42 @@ class RowParallelLinear(LinearBase):
             )
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
-        # Matrix multiply.
+        # Check if we should use iris matmul
+        # Conditions: iris enabled, unquantized weights, TP > 1, and reduce_results enabled
+        # Use class name check to avoid circular import issues
+        is_unquantized = (
+            self.quant_method is not None
+            and self.quant_method.__class__.__name__ == "UnquantizedLinearMethod"
+        )
+        use_iris = (
+            self.iris_matmul_layer is not None
+            and not skip_all_reduce
+            and self.reduce_results
+            and self.tp_size > 1
+            and is_unquantized
+        )
+
+        if use_iris:
+            # Use iris fused GEMM + AllReduce
+            try:
+                # Get weight tensor from the quant method
+                weight = self.weight
+                # Only add bias on rank 0 to avoid duplicates
+                bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+                # Call iris matmul (performs GEMM + AllReduce in one fused kernel)
+                output = self.iris_matmul_layer.forward(input_parallel, weight, bias_)
+
+                output_bias = self.bias if self.skip_bias_add else None
+                return output, output_bias
+            except Exception as e:
+                # Fall back to standard path if iris fails
+                logger.warning(
+                    f"Iris matmul failed, falling back to standard path: {e}"
+                )
+                # Continue to standard path below
+
+        # Standard path: Matrix multiply followed by AllReduce
         assert self.quant_method is not None
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)

@@ -687,6 +687,64 @@ class ModelRunner:
                 model_config=self.model_config,
             )
 
+            # Initialize iris shared memory if enabled
+            self.iris_shmem = None
+            if os.getenv("SGL_USE_IRIS_MATMUL", "0") == "1" and self.device == "cuda":
+                try:
+                    from sglang.srt.layers.iris_matmul import set_iris_shmem
+
+                    # CRITICAL: Patch allocator BEFORE importing iris
+                    # iris.__init__.py tries to change allocator on import
+                    original_change_allocator = (
+                        torch.cuda.memory.change_current_allocator
+                    )
+
+                    def patched_change_allocator(allocator):
+                        """Skip allocator change if already initialized."""
+                        if torch.cuda.is_initialized():
+                            logger.info(
+                                "Skipping CUDA allocator change (already initialized). Iris will use PyTorch's allocator."
+                            )
+                            return
+                        original_change_allocator(allocator)
+
+                    # Apply patch temporarily
+                    torch.cuda.memory.change_current_allocator = (
+                        patched_change_allocator
+                    )
+
+                    # Now safe to import iris
+                    import iris
+
+                    # Restore original (though it won't be called again)
+                    torch.cuda.memory.change_current_allocator = (
+                        original_change_allocator
+                    )
+
+                    # Initialize iris shared memory for fused GEMM+AllReduce
+                    # Heap size: 8GB (matches iris benchmark default)
+                    heap_size = int(
+                        os.getenv("SGL_IRIS_HEAP_SIZE", str(8 * 1024 * 1024 * 1024))
+                    )
+                    logger.info(
+                        f"Initializing iris shared memory (heap_size={heap_size / (1024**3):.1f}GB)"
+                    )
+                    self.iris_shmem = iris.iris(heap_size)
+
+                    # Set global iris shmem for use by layers
+                    set_iris_shmem(self.iris_shmem)
+
+                    logger.info(
+                        f"Iris initialized: rank={self.iris_shmem.get_rank()}, "
+                        f"world_size={self.iris_shmem.get_num_ranks()}, "
+                        f"cu_count={self.iris_shmem.get_cu_count()}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to initialize iris shared memory: {e}. Falling back to PyTorch."
+                    )
+                    self.iris_shmem = None
+
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
