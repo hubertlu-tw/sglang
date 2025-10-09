@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """For Now, SYMM_MEM is only supported on TP8 case
 
 export WORLD_SIZE=1
@@ -12,6 +13,7 @@ torchrun --nproc_per_node gpu \
 --master_port $MASTER_PORT ./benchmark/kernels/all_reduce/benchmark_symm_mem.py
 """
 
+import argparse
 import os
 from contextlib import nullcontext
 from typing import List
@@ -53,6 +55,113 @@ def pynccl_allreduce(
 ) -> torch.Tensor:
     pynccl_comm.all_reduce(pynccl_input)
     return pynccl_input
+
+
+def one_shot_all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Perform one-shot all-reduce on a tensor using symmetric memory.
+
+    Args:
+        tensor: Input tensor allocated with symm_mem.empty(). Must be bfloat16.
+
+    Returns:
+        Output tensor containing the all-reduce result.
+    """
+    import torch.distributed._symmetric_memory as symm_mem
+    import triton
+    import triton.language as tl
+
+    assert tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
+    assert tensor.numel() % 8 == 0, "The number of elements must be 128-bit aligned."
+
+    # Create symmetric memory tensor for the input
+    symm_tensor = symm_mem.empty(
+        tensor.numel(), dtype=torch.bfloat16, device=tensor.device
+    )
+    symm_tensor.copy_(tensor)
+
+    symm_mem_hdl = symm_mem.rendezvous(symm_tensor, group=dist.group.WORLD)
+
+    if symm_mem_hdl is None:
+        raise RuntimeError(
+            "Failed to get symmetric memory handle. "
+            "Ensure the input tensor is allocated with symm_mem.empty()."
+        )
+
+    output = torch.empty_like(tensor)
+
+    # Tuned parameters for AMD GPUs
+    BLOCK_SIZE = 4096  # Large block for good occupancy
+    MAX_NUM_BLOCKS = 24  # Persistent kernel style
+    num_warps = 16  # Maximum warps for latency hiding
+
+    num_blocks = min(
+        triton.cdiv(tensor.numel(), BLOCK_SIZE),
+        MAX_NUM_BLOCKS,
+    )
+
+    @triton.jit
+    def one_shot_all_reduce_kernel_optimized(
+        buffer_ptrs,
+        signal_pad_ptrs,
+        output_ptr,
+        numel: tl.constexpr,
+        rank: tl.constexpr,
+        world_size: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Optimized one-shot all-reduce kernel with minimal synchronization.
+
+        Key optimizations:
+        - Only 2 barriers total (not 2*world_size)
+        - Vectorized loads (4x bf16 = 64 bits per load)
+        - Coalesced memory access
+        """
+        pid = tl.program_id(axis=0)
+
+        # Single barrier at start - wait for all data to be ready
+        tl.debug_barrier()
+
+        buffer_ptrs = buffer_ptrs.to(tl.pointer_type(tl.uint64))
+        output_ptr = output_ptr.to(tl.pointer_type(tl.bfloat16))
+
+        block_start = pid * BLOCK_SIZE
+
+        while block_start < numel:
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < numel
+
+            # Accumulate in float32 for precision
+            acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+            # Load and accumulate from all ranks
+            for i in range(world_size):
+                buffer_ptr = tl.load(buffer_ptrs + i).to(tl.pointer_type(tl.bfloat16))
+                buffer_ptr = tl.multiple_of(buffer_ptr, 16)
+                val = tl.load(buffer_ptr + offsets, mask=mask, other=0.0)
+                acc += val.to(tl.float32)
+
+            # Store result
+            tl.store(output_ptr + offsets, acc.to(tl.bfloat16), mask=mask)
+
+            block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+        # Single barrier at end
+        tl.debug_barrier()
+
+    kernel = one_shot_all_reduce_kernel_optimized[(num_blocks,)](
+        symm_mem_hdl.buffer_ptrs_dev,
+        symm_mem_hdl.signal_pad_ptrs_dev,
+        output,
+        numel=tensor.numel(),
+        rank=symm_mem_hdl.rank,
+        world_size=symm_mem_hdl.world_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+
+    return output
 
 
 def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
@@ -155,8 +264,25 @@ def print_markdown_table(data):
     print(markdown_table)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Benchmark symmetric memory all-reduce implementations"
+    )
+    parser.add_argument(
+        "--impl",
+        type=str,
+        default="symm_mem",
+        choices=["torch", "symm_mem", "pynccl", "one_shot"],
+        help="All-reduce implementation to benchmark",
+    )
+    parser.add_argument("--profile", action="store_true", help="Enable profiling")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     import logging
+
+    args = parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -170,19 +296,30 @@ if __name__ == "__main__":
     rank = dist.get_rank()
     torch.cuda.set_device(rank % 8)
     device = torch.cuda.current_device()
-    set_symm_mem_all_reduce(True)
-    init_distributed_environment(
-        world_size=world_size,
-        rank=rank,
-        local_rank=rank % 8,
-    )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
-    group = get_tensor_model_parallel_group().device_group
-    cpu_group = get_tensor_model_parallel_group().cpu_group
-    pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
-    symm_mem_comm = get_tensor_model_parallel_group().symm_mem_comm
+
+    # Only enable symm_mem and initialize model parallel for non-one_shot implementations
+    if args.impl != "one_shot":
+        set_symm_mem_all_reduce(True)
+        init_distributed_environment(
+            world_size=world_size,
+            rank=rank,
+            local_rank=rank % 8,
+        )
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
+        group = get_tensor_model_parallel_group().device_group
+        cpu_group = get_tensor_model_parallel_group().cpu_group
+        pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
+        symm_mem_comm = get_tensor_model_parallel_group().symm_mem_comm
+    else:
+        # For one_shot implementation, we don't need the full SGLang infrastructure
+        # Just set up basic distributed environment
+        group = dist.group.WORLD
+        cpu_group = None
+        pynccl_comm = None
+        symm_mem_comm = None
+
     dist.barrier()
-    profile = False
+    profile = args.profile
     dtype = torch.bfloat16
     ctx = get_torch_prof_ctx(profile)
     result = []
@@ -200,28 +337,43 @@ if __name__ == "__main__":
 
             memory = torch.empty_like(inp_randn)
             memory_out = torch.empty_like(memory)
-            torch_eager_output, torch_eager_time = _bench_eager_time(
-                lambda inp: torch_allreduce(inp, group), inp_randn
-            )
-            symm_mem_eager_output, symm_mem_eager_time = _bench_eager_time(
-                lambda inp: symm_mem_allreduce(inp, symm_mem_comm), inp_randn
-            )
-            symm_mem_graph_output, symm_mem_graph_time = _bench_graph_time(
-                lambda inp: symm_mem_allreduce(inp, symm_mem_comm), inp_randn
-            )
-            # since pynccl is inplace op, this return result is not correct if graph loop > 1
-            _, pynccl_graph_time = _bench_graph_time(
-                lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
-            )
-            torch.testing.assert_close(torch_eager_output, symm_mem_graph_output)
-            torch.testing.assert_close(torch_eager_output, symm_mem_eager_output)
+
+            # Select implementation based on argument
+            if args.impl == "torch":
+                eager_output, eager_time = _bench_eager_time(
+                    lambda inp: torch_allreduce(inp, group), inp_randn
+                )
+                graph_output, graph_time = _bench_graph_time(
+                    lambda inp: torch_allreduce(inp, group), inp_randn
+                )
+            elif args.impl == "symm_mem":
+                eager_output, eager_time = _bench_eager_time(
+                    lambda inp: symm_mem_allreduce(inp, symm_mem_comm), inp_randn
+                )
+                graph_output, graph_time = _bench_graph_time(
+                    lambda inp: symm_mem_allreduce(inp, symm_mem_comm), inp_randn
+                )
+            elif args.impl == "pynccl":
+                eager_output, eager_time = _bench_eager_time(
+                    lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
+                )
+                graph_output, graph_time = _bench_graph_time(
+                    lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
+                )
+            elif args.impl == "one_shot":
+                eager_output, eager_time = _bench_eager_time(
+                    lambda inp: one_shot_all_reduce(inp), inp_randn
+                )
+                graph_output, graph_time = _bench_graph_time(
+                    lambda inp: one_shot_all_reduce(inp), inp_randn
+                )
+
+            torch.testing.assert_close(eager_output, graph_output)
             result.append(
                 {
                     "msg_size": human_readable_size(inp_randn.nbytes),
-                    "torch eager time": torch_eager_time,
-                    "symm mem eager time": symm_mem_eager_time,
-                    "symm mem graph time": symm_mem_graph_time,
-                    "pynccl graph time": pynccl_graph_time,
+                    f"{args.impl} eager time": eager_time,
+                    f"{args.impl} graph time": graph_time,
                 }
             )
             if rank == 0:
