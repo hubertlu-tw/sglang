@@ -56,6 +56,7 @@ python setup_rocm.py install
 cd ..
 pip install -e "python[all_hip]"
 ```
+We also support building `sgl-kernel` with CMake. However, it requires extensive environment setup and we do not recommend users building `sgl-kernel` using CMake.
 
 ### Install Using Docker (Recommended)
 
