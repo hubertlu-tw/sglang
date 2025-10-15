@@ -14,11 +14,11 @@ fi
 # Install the required dependencies in CI.
 docker exec ci_sglang pip install --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
+docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
 
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
-    docker exec ci_sglang pip install -i https://test.pypi.org/simple/ sgl-kernel-rocm700
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
     docker exec ci_sglang pip install -e "python[dev_hip]" --no-deps # TODO: only for mi35x
     # For lmms_evals evaluating MMMU
@@ -27,7 +27,6 @@ case "${GPU_ARCH}" in
     ;;
   mi30x|mi300|mi325)
     echo "Runner uses ${GPU_ARCH}; will fetch mi30x image."
-    docker exec ci_sglang pip install -i https://test.pypi.org/simple/ sgl-kernel-rocm630
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
     docker exec ci_sglang pip install -e "python[dev_hip]"
     # For lmms_evals evaluating MMMU
