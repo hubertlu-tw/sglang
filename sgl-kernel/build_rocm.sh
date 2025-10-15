@@ -4,16 +4,13 @@ ROCM_VERSION=$1
 
 if [ "$ROCM_VERSION" = "700" ]; then
   PYTHON_ROOT_PATH="/opt/venv/bin"
-else
-  PYTHON_ROOT_PATH="/usr/bin"
-fi
-echo "Python root path is: $PYTHON_ROOT_PATH"
-
-if [ "$ROCM_VERSION" = "700" ]; then
   AMDGPU_TARGET="gfx942;gfx950"
 else
+  PYTHON_ROOT_PATH="/usr/bin"
   AMDGPU_TARGET="gfx942"
 fi
+
+echo "Python root path is: $PYTHON_ROOT_PATH"
 
 # Get version from SGLang version.py file
 SGLANG_VERSION_FILE="$(dirname "$0")/../python/sglang/version.py"
@@ -60,7 +57,6 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
-# Normalise / collapse architectures we don't yet build specifically for
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
@@ -75,14 +71,11 @@ case "${GPU_ARCH}" in
     ;;
 esac
 
-
-# Set up DEVICE_FLAG based on Kubernetes pod info
 if [[ -f /etc/podinfo/gha-render-devices ]]; then
   DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
 else
   DEVICE_FLAG="--device /dev/dri"
 fi
-
 
 # Find the latest image
 find_latest_image() {
