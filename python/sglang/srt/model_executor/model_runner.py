@@ -834,6 +834,37 @@ class ModelRunner:
 
         self.dtype = self.model_config.dtype
 
+        # Initialize Triton symm_mem buffer if enabled
+        if (
+            self.server_args.enable_triton_allreduce_fusion
+            and self.server_args.enable_torch_symm_mem
+        ):
+            from sglang.srt.layers.triton_comm_manager import (
+                initialize_triton_symm_mem_buffer,
+            )
+
+            # Use max_total_tokens from server_args or default value
+            max_tokens = (
+                self.server_args.max_total_tokens
+                if self.server_args.max_total_tokens
+                else 8192
+            )
+            hidden_dim = self.model_config.hidden_size
+
+            buffer = initialize_triton_symm_mem_buffer(
+                max_tokens=max_tokens,
+                hidden_dim=hidden_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            if buffer is not None:
+                logger.info("Triton allreduce fusion enabled with symm_mem buffer")
+            else:
+                logger.warning(
+                    "Failed to initialize Triton symm_mem buffer, fusion disabled"
+                )
+
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(

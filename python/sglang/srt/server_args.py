@@ -398,6 +398,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
+    enable_triton_allreduce_fusion: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -2557,6 +2558,11 @@ class ServerArgs:
             "--enable-torch-symm-mem",
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM10 supports world size 6, 8.",
+        )
+        parser.add_argument(
+            "--enable-triton-allreduce-fusion",
+            action="store_true",
+            help="Enable Triton-based allreduce fusion with residual and RMSNorm operations for improved performance. Requires --enable-torch-symm-mem.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

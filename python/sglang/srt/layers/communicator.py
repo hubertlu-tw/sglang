@@ -221,11 +221,30 @@ class LayerCommunicator:
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
+            # Attach symm_mem buffer if Triton fusion is enabled
+            if global_server_args_dict.get("enable_triton_allreduce_fusion", False):
+                from sglang.srt.layers.triton_comm_manager import (
+                    attach_symm_mem_buffer,
+                    is_triton_symm_mem_enabled,
+                )
+
+                if is_triton_symm_mem_enabled():
+                    hidden_states = attach_symm_mem_buffer(hidden_states)
+                    if hasattr(hidden_states, "_symm_mem_buffer"):
+                        logger.debug(
+                            f"Attached symm_mem buffer to tensor in prepare_attn, shape: {hidden_states.shape}"
+                        )
+
             if (
                 residual is not None
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
+                # Remove the fusion flag to avoid double processing
+                delattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                logger.debug(
+                    f"Triggering allreduce fusion for tensor shape: {hidden_states.shape}"
+                )
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
                         hidden_states, residual
@@ -281,13 +300,31 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
+        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+
+        # Attach symm_mem buffer if Triton fusion is enabled
+        if global_server_args_dict.get("enable_triton_allreduce_fusion", False):
+            from sglang.srt.layers.triton_comm_manager import (
+                attach_symm_mem_buffer,
+                is_triton_symm_mem_enabled,
+            )
+
+            if is_triton_symm_mem_enabled():
+                # Check if the tensor will need allreduce fusion in the next layer
+                # This happens when should_allreduce_fusion is True in the MLP forward
+                hidden_states = attach_symm_mem_buffer(hidden_states)
+                if hasattr(hidden_states, "_symm_mem_buffer"):
+                    logger.debug(
+                        f"Attached symm_mem buffer to tensor in prepare_mlp, shape: {hidden_states.shape}"
+                    )
+
+        return hidden_states, residual
 
     def postprocess_layer(
         self,
@@ -314,6 +351,16 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        # FORCE fusion when Triton is enabled
+        triton_fusion = global_server_args_dict.get(
+            "enable_triton_allreduce_fusion", False
+        ) and global_server_args_dict.get("enable_torch_symm_mem", False)
+
+        if triton_fusion and (not self.is_last_layer) and (self._context.tp_size > 1):
+            logger.info(f"FORCING allreduce fusion for layer (Triton enabled)")
+            return True
+
+        # Original logic for other cases
         speculative_algo = global_server_args_dict.get("speculative_algorithm", None)
         if (
             is_dp_attention_enabled()
@@ -330,11 +377,16 @@ class LayerCommunicator:
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
             return False
 
+        # Check for either FlashInfer or Triton allreduce fusion
+        flashinfer_fusion = (
+            global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
+            and _is_flashinfer_available
+        )
+
         static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
-            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
-            and _is_flashinfer_available
+            and (flashinfer_fusion or triton_fusion)
         )
 
         if not static_conditions_met:

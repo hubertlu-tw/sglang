@@ -217,21 +217,84 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward method with allreduce fusion, prioritizing flashinfer fused operations
+        Forward method with allreduce fusion, prioritizing Triton or flashinfer fused operations
         """
         if residual is not None:
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
-            from sglang.srt.layers.flashinfer_comm_fusion import (
-                flashinfer_allreduce_residual_rmsnorm,
-            )
-
-            fused_op = (
-                torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm
-                if supports_custom_op()
-                else flashinfer_allreduce_residual_rmsnorm
-            )
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
 
             if get_tensor_model_parallel_world_size() > 1:
+                # Check if Triton allreduce fusion is enabled
+                enable_triton_fusion = global_server_args_dict.get(
+                    "enable_triton_allreduce_fusion", False
+                )
+                enable_torch_symm_mem = global_server_args_dict.get(
+                    "enable_torch_symm_mem", False
+                )
+
+                if enable_triton_fusion and enable_torch_symm_mem:
+                    # FORCE Triton-based allreduce fusion
+                    import logging
+
+                    import torch.distributed._symmetric_memory as symm_mem
+
+                    from sglang.srt.distributed import get_tensor_model_parallel_group
+                    from sglang.srt.layers.triton_comm_fusion import (
+                        triton_allreduce_residual_rmsnorm,
+                    )
+                    from sglang.srt.layers.triton_comm_manager import (
+                        attach_symm_mem_buffer,
+                        get_triton_symm_mem_buffer,
+                    )
+
+                    logger = logging.getLogger(__name__)
+
+                    # Force attach symm_mem buffer if not present
+                    symm_mem_buffer = getattr(x, "_symm_mem_buffer", None)
+                    if symm_mem_buffer is None:
+                        # Create a temporary buffer for this operation
+                        buffer_size = x.numel()
+                        device = x.device
+                        dtype = x.dtype
+                        symm_mem_buffer = symm_mem.empty(
+                            buffer_size, device=device, dtype=dtype
+                        )
+                        logger.info(
+                            f"FORCING Triton fusion: Created temp symm_mem buffer for shape {x.shape}"
+                        )
+
+                    logger.info(
+                        f"FORCING Triton allreduce fusion kernel for tensor shape {x.shape}"
+                    )
+
+                    # Use custom op if available, otherwise fall back to direct call
+                    triton_op = (
+                        torch.ops.sglang.triton_allreduce_residual_rmsnorm
+                        if supports_custom_op()
+                        else triton_allreduce_residual_rmsnorm
+                    )
+
+                    output = triton_op(
+                        input=x,
+                        residual=residual,
+                        weight=self.weight,
+                        eps=self.variance_epsilon,
+                        symm_mem_buffer=symm_mem_buffer,
+                        group=get_tensor_model_parallel_group(),
+                    )
+                    return output, residual
+
+                # Fall back to FlashInfer fusion
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    flashinfer_allreduce_residual_rmsnorm,
+                )
+
+                fused_op = (
+                    torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm
+                    if supports_custom_op()
+                    else flashinfer_allreduce_residual_rmsnorm
+                )
+
                 fused_result = fused_op(
                     input_tensor=x,
                     residual=residual,
