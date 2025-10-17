@@ -301,6 +301,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.symm_mem import (
             SymmMemCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.symm_mem_one_shot import (
+            SymmMemOneShotCommunicator,
+        )
 
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
@@ -352,6 +355,12 @@ class GroupCoordinator:
         self.symm_mem_comm: Optional[SymmMemCommunicator] = None
         if self.use_torch_symm_mem and self.world_size > 1:
             self.symm_mem_comm = SymmMemCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+        self.symm_mem_one_shot_comm: Optional[SymmMemOneShotCommunicator] = None
+        if self.use_torch_symm_mem and self.world_size > 1:
+            self.symm_mem_one_shot_comm = SymmMemOneShotCommunicator(
                 group=self.cpu_group,
                 device=self.device,
             )
@@ -544,6 +553,20 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
+
+        # TODO (Hubert): Move symm_mem and symm_mem_one_shot?
+        # if (
+        #     self.symm_mem_one_shot_comm is not None
+        #     and not self.symm_mem_one_shot_comm.disabled
+        #     and self.symm_mem_one_shot_comm.should_one_shot_allreduce(input_)
+        # ):
+        #     outplace_all_reduce_method = "one_shot"
+        # elif (
+        #     self.symm_mem_comm is not None
+        #     and not self.symm_mem_comm.disabled
+        #     and self.symm_mem_comm.should_symm_mem_allreduce(input_)
+        # ):
+        #     outplace_all_reduce_method = "symm_mem"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
@@ -562,12 +585,12 @@ class GroupCoordinator:
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
             outplace_all_reduce_method = "pymscclpp"
-        elif (
-            self.symm_mem_comm is not None
-            and not self.symm_mem_comm.disabled
-            and self.symm_mem_comm.should_symm_mem_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "symm_mem"
+        # elif (
+        #     self.symm_mem_comm is not None
+        #     and not self.symm_mem_comm.disabled
+        #     and self.symm_mem_comm.should_symm_mem_allreduce(input_)
+        # ):
+        #     outplace_all_reduce_method = "symm_mem"
         if outplace_all_reduce_method is not None:
             return torch.ops.sglang.outplace_all_reduce(
                 input_,
@@ -585,6 +608,7 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         symm_mem_comm = self.symm_mem_comm
+        symm_mem_one_shot_comm = self.symm_mem_one_shot_comm
         assert any([qr_comm, ca_comm, pymscclpp_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
@@ -595,6 +619,9 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "symm_mem":
             assert not symm_mem_comm.disabled
             out = symm_mem_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "one_shot":
+            assert not symm_mem_one_shot_comm.disabled
+            out = symm_mem_one_shot_comm.one_shot_all_reduce(input_)
         else:
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
@@ -1223,6 +1250,10 @@ class GroupCoordinator:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
+        if self.symm_mem_one_shot_comm is not None:
+            self.symm_mem_one_shot_comm = None
+        if self.symm_mem_comm is not None:
+            self.symm_mem_comm = None
 
 
 _WORLD: Optional[GroupCoordinator] = None
