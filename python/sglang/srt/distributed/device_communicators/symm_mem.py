@@ -11,24 +11,19 @@ from sglang.srt.distributed.device_communicators.all_reduce_utils import (
 )
 from sglang.srt.utils import get_device_capability, is_cuda, is_hip
 
-try:
-    import torch.distributed._symmetric_memory as torch_symm_mem
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+symm_mem_available = False
+if _is_cuda or _is_hip:
+    try:
+        import torch.distributed._symmetric_memory as torch_symm_mem
 
-    symm_mem_available = True
-except ImportError:
-    symm_mem_available = False
+        symm_mem_available = True
+    except ImportError:
+        symm_mem_available = False
 
 
 logger = logging.getLogger(__name__)
-
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-
-symm_mem_is_available = False
-if _is_hip:
-    symm_mem_is_available = False
-if _is_cuda:
-    symm_mem_is_available = True
 
 
 class SymmMemCommunicator:
@@ -74,7 +69,7 @@ class SymmMemCommunicator:
         self.device = device
         self.group = group
         self.world_size = dist.get_world_size(self.group)
-        self.device_capability = torch.cuda.get_device_capability(device)[0]
+        self.device_capability = get_device_capability(device)[0]
         if self.device_capability < 9:
             logger.warning(
                 "SymmMemCommunicator: Device capability %s not supported, "
@@ -82,16 +77,31 @@ class SymmMemCommunicator:
                 self.device_capability,
             )
             return
-        if self.world_size not in SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability]:
+        if _is_cuda:
+            if (
+                self.world_size
+                not in SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability]
+            ):
+                logger.warning(
+                    "SymmMemCommunicator: World size %d not supported, "
+                    "communicator is not available.",
+                    self.world_size,
+                )
+                return
+            else:
+                self.max_size = SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
+                    self.world_size
+                ]
+        else:
+            # AMD GPUs
+            self.max_size = (
+                64 * 1024 * 1024
+            )  # 64MB default size # TODO (Hubert): tune this later
             logger.warning(
-                "SymmMemCommunicator: World size %d not supported, "
-                "communicator is not available.",
-                self.world_size,
+                "SymmMemCommunicator: Using default max size %d for capability %d on AMD GPUs",
+                self.max_size,
+                self.device_capability,
             )
-            return
-        self.max_size = SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
-            self.world_size
-        ]
         self.buffer = torch_symm_mem.empty(
             self.max_size // self.dtype.itemsize,
             device=self.device,
@@ -102,10 +112,8 @@ class SymmMemCommunicator:
             logger.warning(
                 "SymmMemCommunicator: symmetric memory "
                 "multicast operations are not supported."
+                "Fallback to two_shot_all_reduce."
             )
-            self.buffer = None
-            self.disabled = True
-            return
         self.disabled = False
 
     def should_symm_mem_allreduce(self, inp: torch.Tensor):
@@ -152,11 +160,15 @@ class SymmMemCommunicator:
         if out is None:
             out = torch.empty_like(inp)
         self.buffer[: inp.numel()].copy_(inp.view(-1))
-        if self.world_size in self._WORLD_SIZES_MULTIMEM[self.device_capability]:
+        if (
+            _is_cuda
+            and self.world_size in self._WORLD_SIZES_MULTIMEM[self.device_capability]
+        ):
             torch.ops.symm_mem.multimem_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )
         else:
+            # assert False, "SymmMemCommunicator: two_shot_all_reduce_ is not available" # TODO (Hubert): remove this later
             torch.ops.symm_mem.two_shot_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )
