@@ -231,8 +231,11 @@ class LayerCommunicator:
                     is_triton_symm_mem_enabled,
                 )
 
+                # TODO: check this!
                 if is_triton_symm_mem_enabled():
-                    hidden_states = attach_symm_mem_buffer(hidden_states)
+                    hidden_states = attach_symm_mem_buffer(
+                        hidden_states, mark_fusion=True
+                    )
                     if hasattr(hidden_states, "_symm_mem_buffer"):
                         logger.debug(
                             f"Attached symm_mem buffer to tensor in prepare_attn, shape: {hidden_states.shape}"
@@ -320,8 +323,9 @@ class LayerCommunicator:
 
             if is_triton_symm_mem_enabled():
                 # Check if the tensor will need allreduce fusion in the next layer
-                # This happens when should_allreduce_fusion is True in the MLP forward
-                hidden_states = attach_symm_mem_buffer(hidden_states)
+                # Mark the hidden states so the next layer triggers fused allreduce.
+                hidden_states = attach_symm_mem_buffer(hidden_states, mark_fusion=True)
+
                 if hasattr(hidden_states, "_symm_mem_buffer"):
                     logger.debug(
                         f"Attached symm_mem buffer to tensor in prepare_mlp, shape: {hidden_states.shape}"
@@ -358,10 +362,6 @@ class LayerCommunicator:
         triton_fusion = global_server_args_dict.get(
             "enable_triton_allreduce_fusion", False
         ) and global_server_args_dict.get("enable_torch_symm_mem", False)
-        # assert triton_fusion == True, "Stop here" # TODO: remove this
-        if triton_fusion and (not self.is_last_layer) and (self._context.tp_size > 1):
-            logger.info(f"FORCING allreduce fusion for layer (Triton enabled)")
-            return True
 
         # Original logic for other cases
         speculative_algo = global_server_args_dict.get("speculative_algorithm", None)

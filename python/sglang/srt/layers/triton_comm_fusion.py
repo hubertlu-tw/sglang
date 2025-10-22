@@ -801,7 +801,7 @@ def triton_allreduce_residual_rmsnorm_kernel_optimized_correct(
     """
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
-
+    tl.debug_barrier()  # TODO: remove this after debugging
     # Precompute constants and offsets
     col_offsets = tl.arange(0, BLOCK_SIZE_N)
     mask = col_offsets < N

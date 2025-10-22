@@ -77,7 +77,9 @@ def is_triton_symm_mem_enabled() -> bool:
 
 
 def attach_symm_mem_buffer(
-    tensor: torch.Tensor, buffer: Optional[torch.Tensor] = None
+    tensor: torch.Tensor,
+    buffer: Optional[torch.Tensor] = None,
+    mark_fusion: bool = False,
 ) -> torch.Tensor:
     """
     Attach symmetric memory buffer to a tensor as an attribute.
@@ -85,6 +87,7 @@ def attach_symm_mem_buffer(
     Args:
         tensor: The tensor to attach the buffer to
         buffer: The buffer to attach (uses global buffer if None)
+        mark_fusion: Whether to mark this tensor for allreduce fusion in the next layer
 
     Returns:
         The tensor with buffer attached
@@ -102,9 +105,20 @@ def attach_symm_mem_buffer(
                     tensor._sglang_needs_allreduce_fusion
                 )
 
-            tensor._symm_mem_buffer = buffer[: tensor.numel()].view_as(tensor)
+            # FIX: Copy the tensor data into the symmetric memory buffer
+            buffer_slice = buffer[: tensor.numel()].view_as(tensor)
+            buffer_slice.copy_(tensor)  # Copy the actual data
+            tensor._symm_mem_buffer = buffer_slice
 
-            # Restore existing attributes
+            # If the flag was already present, restore it; otherwise set it only when mark_fusion is True.
+            if "_sglang_needs_allreduce_fusion" in existing_attrs:
+                tensor._sglang_needs_allreduce_fusion = existing_attrs[
+                    "_sglang_needs_allreduce_fusion"
+                ]
+            elif mark_fusion:
+                tensor._sglang_needs_allreduce_fusion = True
+
+            # Restore any other preserved attributes
             for attr_name, attr_value in existing_attrs.items():
                 setattr(tensor, attr_name, attr_value)
         else:
