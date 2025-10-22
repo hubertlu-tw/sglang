@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -52,6 +53,8 @@ from sglang.srt.utils import (
     is_sm100_supported,
     prepare_weight_cache,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = is_cuda() and is_sm90_supported()
@@ -355,7 +358,7 @@ class LayerCommunicator:
         triton_fusion = global_server_args_dict.get(
             "enable_triton_allreduce_fusion", False
         ) and global_server_args_dict.get("enable_torch_symm_mem", False)
-
+        # assert triton_fusion == True, "Stop here" # TODO: remove this
         if triton_fusion and (not self.is_last_layer) and (self._context.tp_size > 1):
             logger.info(f"FORCING allreduce fusion for layer (Triton enabled)")
             return True
@@ -577,15 +580,42 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
-            # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-            # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+            # Enable fused RMSNorm + residual + allreduce when either FlashInfer (CUDA)
+            # or Triton (HIP) fusion is enabled and the batch size is within limits.
+            use_fused_allreduce = False
             if (
-                (_is_sm100_supported or _is_sm90_supported)
-                and _is_flashinfer_available
-                and hasattr(layernorm, "forward_with_allreduce_fusion")
-                and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
+                hasattr(layernorm, "forward_with_allreduce_fusion")
                 and hidden_states.shape[0] <= 4096
             ):
+                # FlashInfer gating: only on H100/A100 and when FlashInfer is available.
+                flashinfer_enabled = (
+                    (_is_sm100_supported or _is_sm90_supported)
+                    and _is_flashinfer_available
+                    and global_server_args_dict.get(
+                        "enable_flashinfer_allreduce_fusion", False
+                    )
+                )
+                # Triton gating: on HIP devices when symmetric memory and fusion are enabled.
+                triton_enabled = (
+                    is_hip()
+                    and global_server_args_dict.get("enable_torch_symm_mem", False)
+                    and global_server_args_dict.get(
+                        "enable_triton_allreduce_fusion", False
+                    )
+                )
+                if flashinfer_enabled or triton_enabled:
+                    use_fused_allreduce = True
+                    # Debug logging
+                    if triton_enabled:
+                        logger.debug(
+                            f"Triton allreduce fusion enabled for batch size {hidden_states.shape[0]}"
+                        )
+                    elif flashinfer_enabled:
+                        logger.debug(
+                            f"FlashInfer allreduce fusion enabled for batch size {hidden_states.shape[0]}"
+                        )
+
+            if use_fused_allreduce:
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )

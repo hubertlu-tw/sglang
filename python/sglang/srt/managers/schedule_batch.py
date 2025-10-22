@@ -109,6 +109,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "weight_loader_disable_mmap",
     "enable_multimodal",
     "enable_symm_mem",
+    "enable_torch_symm_mem",
+    "enable_triton_allreduce_fusion",
     "enable_custom_logit_processor",
     "disaggregation_mode",
     "enable_deterministic_inference",

@@ -217,92 +217,133 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward method with allreduce fusion, prioritizing Triton or flashinfer fused operations
+        Fused RMSNorm + residual + allreduce.
+
+        Tries the Triton symmetric-memory fusion first (on ROCm when
+        `enable_torch_symm_mem` and `enable_triton_allreduce_fusion` are set),
+        then falls back to the FlashInfer fusion when
+        `enable_flashinfer_allreduce_fusion` is enabled, and finally falls
+        back to the unfused implementation.
         """
         if residual is not None:
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
             from sglang.srt.managers.schedule_batch import global_server_args_dict
+            from sglang.srt.utils import (
+                is_flashinfer_available,
+                is_hip,
+                supports_custom_op,
+            )
 
-            if get_tensor_model_parallel_world_size() > 1:
-                # Check if Triton allreduce fusion is enabled
-                enable_triton_fusion = global_server_args_dict.get(
-                    "enable_triton_allreduce_fusion", False
-                )
-                enable_torch_symm_mem = global_server_args_dict.get(
+            # Check if distributed environment is initialized
+            try:
+                world_size = get_tensor_model_parallel_world_size()
+            except AssertionError:
+                # Distributed environment not initialized, single GPU
+                world_size = 1
+
+            if world_size > 1:
+                # Try Triton fused path on HIP devices when symmetric memory is enabled.
+                if global_server_args_dict.get(
                     "enable_torch_symm_mem", False
-                )
-
-                if enable_triton_fusion and enable_torch_symm_mem:
-                    # FORCE Triton-based allreduce fusion
+                ) and global_server_args_dict.get(
+                    "enable_triton_allreduce_fusion", False
+                ):
+                    # Debug logging
                     import logging
 
-                    import torch.distributed._symmetric_memory as symm_mem
-
-                    from sglang.srt.distributed import get_tensor_model_parallel_group
                     from sglang.srt.layers.triton_comm_fusion import (
-                        triton_allreduce_residual_rmsnorm,
-                    )
-                    from sglang.srt.layers.triton_comm_manager import (
-                        attach_symm_mem_buffer,
-                        get_triton_symm_mem_buffer,
+                        triton_allreduce_residual_rmsnorm_wrapper,
                     )
 
                     logger = logging.getLogger(__name__)
-
-                    # Force attach symm_mem buffer if not present
-                    symm_mem_buffer = getattr(x, "_symm_mem_buffer", None)
-                    if symm_mem_buffer is None:
-                        # Create a temporary buffer for this operation
-                        buffer_size = x.numel()
-                        device = x.device
-                        dtype = x.dtype
-                        symm_mem_buffer = symm_mem.empty(
-                            buffer_size, device=device, dtype=dtype
-                        )
-                        logger.info(
-                            f"FORCING Triton fusion: Created temp symm_mem buffer for shape {x.shape}"
-                        )
-
-                    logger.info(
-                        f"FORCING Triton allreduce fusion kernel for tensor shape {x.shape}"
+                    logger.debug(
+                        f"Attempting Triton fused allreduce for shape {x.shape}"
                     )
 
-                    # Use custom op if available, otherwise fall back to direct call
-                    triton_op = (
-                        torch.ops.sglang.triton_allreduce_residual_rmsnorm
-                        if supports_custom_op()
-                        else triton_allreduce_residual_rmsnorm
-                    )
+                    # Debug logging
+                    # logger.debug(
+                    #     f"Triton fusion - input shape: {x.shape}, contiguous: {x.is_contiguous()}, dtype: {x.dtype}"
+                    # )
+                    # logger.debug(
+                    #     f"Triton fusion - residual shape: {residual.shape}, contiguous: {residual.is_contiguous()}, dtype: {residual.dtype}"
+                    # )
+                    # logger.debug(
+                    #     f"Triton fusion - weight shape: {self.weight.shape}, contiguous: {self.weight.is_contiguous()}, dtype: {self.weight.dtype}"
+                    # )
 
-                    output = triton_op(
-                        input=x,
+                    # Detailed tensor properties for accuracy debugging
+                    # logger.debug(
+                    #     f"Input strides: {x.stride()}, memory format: {x.layout}"
+                    # )
+                    # logger.debug(
+                    #     f"Residual strides: {residual.stride()}, memory format: {residual.layout}"
+                    # )
+                    # logger.debug(
+                    #     f"Weight strides: {self.weight.stride()}, memory format: {self.weight.layout}"
+                    # )
+
+                    # Sample data values for debugging accuracy issues
+                    # logger.debug(
+                    #     f"Input sample data (first 5 elements): {x.flatten()[:5].tolist()}"
+                    # )
+                    # logger.debug(
+                    #     f"Residual sample data (first 5 elements): {residual.flatten()[:5].tolist()}"
+                    # )
+                    # logger.debug(
+                    #     f"Weight sample data (first 5 elements): {self.weight.flatten()[:5].tolist()}"
+                    # )
+
+                    # Ensure tensors are contiguous like in forward_native
+                    if not x.is_contiguous():
+                        x = x.contiguous()
+                        logger.debug("Made input tensor contiguous for Triton fusion")
+                    if not residual.is_contiguous():
+                        residual = residual.contiguous()
+                        logger.debug(
+                            "Made residual tensor contiguous for Triton fusion"
+                        )
+
+                    fused_result = triton_allreduce_residual_rmsnorm_wrapper(
+                        input_tensor=x,
                         residual=residual,
                         weight=self.weight,
                         eps=self.variance_epsilon,
-                        symm_mem_buffer=symm_mem_buffer,
-                        group=get_tensor_model_parallel_group(),
+                        max_token_num=x.shape[0],
                     )
-                    return output, residual
+                    if fused_result is not None:
+                        logger.debug(
+                            f"Triton fused allreduce succeeded for shape {x.shape}"
+                        )
+                        return fused_result, residual
+                    else:
+                        logger.debug(
+                            f"Triton fused allreduce failed, falling back for shape {x.shape}"
+                        )
 
-                # Fall back to FlashInfer fusion
-                from sglang.srt.layers.flashinfer_comm_fusion import (
-                    flashinfer_allreduce_residual_rmsnorm,
-                )
+                # Try FlashInfer fused path when available and enabled.
+                if (
+                    global_server_args_dict.get(
+                        "enable_flashinfer_allreduce_fusion", False
+                    )
+                    and is_flashinfer_available()
+                ):
+                    from sglang.srt.layers.flashinfer_comm_fusion import (
+                        flashinfer_allreduce_residual_rmsnorm,
+                    )
 
-                fused_op = (
-                    torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm
-                    if supports_custom_op()
-                    else flashinfer_allreduce_residual_rmsnorm
-                )
-
-                fused_result = fused_op(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    eps=self.variance_epsilon,
-                )
-                if fused_result[0] is not None:
-                    return fused_result
+                    fused_op = (
+                        torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm
+                        if supports_custom_op()
+                        else flashinfer_allreduce_residual_rmsnorm
+                    )
+                    fused_result = fused_op(
+                        input_tensor=x,
+                        residual=residual,
+                        weight=self.weight,
+                        eps=self.variance_epsilon,
+                    )
+                    if fused_result[0] is not None:
+                        return fused_result
 
         return self.forward(x, residual)
 

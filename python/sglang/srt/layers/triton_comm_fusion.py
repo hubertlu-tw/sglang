@@ -1124,6 +1124,18 @@ def triton_allreduce_residual_rmsnorm(
     """
     Python wrapper for the fused All-Reduce, Residual Add, and RMSNorm Triton kernel.
     """
+    # Input validation
+    assert input.is_cuda and residual.is_cuda and weight.is_cuda
+    assert (
+        input.is_contiguous() and residual.is_contiguous()
+    ), "Input and residual tensors must be contiguous"
+    assert input.shape == residual.shape, "Input and residual shapes must match"
+    assert (
+        input.shape[-1] == weight.shape[-1]
+    ), "Last dim of input and weight must match"
+    assert input.dtype == torch.bfloat16, "Only bfloat16 is supported for now"
+    assert residual.dtype == input.dtype and weight.dtype == input.dtype
+
     M, N = input.shape
     output = torch.empty_like(input)
 
@@ -1139,6 +1151,10 @@ def triton_allreduce_residual_rmsnorm(
     assert (
         symm_mem_hdl is not None
     ), "symm_mem_buffer must be a symmetric memory tensor."
+    assert (
+        symm_mem_buffer.numel() >= input.numel()
+    ), "Symmetric memory buffer is too small."
+    symm_mem_hdl.barrier()  # TODO: remove this as it does not improve accuracy
 
     num_blocks = min(M, 120)
     grid = (num_blocks,)
@@ -1193,6 +1209,7 @@ def triton_allreduce_residual_rmsnorm(
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         num_warps=num_warps,
     )
+    symm_mem_hdl.barrier()  # TODO: remove this as it does not improve accuracy
     return output
 
 
@@ -1210,11 +1227,77 @@ def fake_triton_allreduce_residual_rmsnorm(
     return torch.empty_like(input)
 
 
+# Fake implementation for the wrapper function
+def fake_triton_allreduce_residual_rmsnorm_wrapper(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    max_token_num: int,
+) -> torch.Tensor:
+    """Fake implementation for the wrapper function when custom op is not supported."""
+    return None
+
+
+# Add the wrapper function that provides the simplified interface
+def triton_allreduce_residual_rmsnorm_wrapper(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    max_token_num: int,
+) -> torch.Tensor:
+    """
+    Wrapper function that provides the simplified interface expected by RMSNorm layer.
+
+    This wrapper:
+    1. Takes the simplified parameters (input_tensor, residual, weight, eps, max_token_num)
+    2. Gets the symmetric memory buffer from the global manager
+    3. Gets the process group from the distributed environment
+    4. Calls the actual triton_allreduce_residual_rmsnorm function
+    """
+    from sglang.srt.distributed import get_tensor_model_parallel_group
+    from sglang.srt.layers.triton_comm_manager import get_triton_symm_mem_buffer
+
+    # Get the symmetric memory buffer
+    symm_mem_buffer = get_triton_symm_mem_buffer()
+    if symm_mem_buffer is None:
+        # Return None to indicate fusion is not available
+        return None
+
+    # Get the process group
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_group
+
+        group = get_tensor_model_parallel_group()
+    except (ImportError, AssertionError):
+        # Fallback for single GPU or when model parallel is not initialized
+        group = "default_triton_group"
+
+    # Call the actual function with proper parameters
+    return triton_allreduce_residual_rmsnorm(
+        input=input_tensor,
+        residual=residual,
+        weight=weight,
+        eps=eps,
+        symm_mem_buffer=symm_mem_buffer,
+        group=group,
+        use_delayed_kernel=False,
+    )
+
+
 # Register as custom op if supported
 if supports_custom_op():
     direct_register_custom_op(
         "triton_allreduce_residual_rmsnorm",
-        triton_allreduce_residual_rmsnorm,
-        mutates_args=["input", "residual", "weight"],
-        fake_impl=fake_triton_allreduce_residual_rmsnorm,
+        triton_allreduce_residual_rmsnorm_wrapper,
+        mutates_args=["input_tensor", "residual", "weight"],
+        fake_impl=fake_triton_allreduce_residual_rmsnorm_wrapper,
     )
+
+
+# Also need to export the wrapper function for custom op registration
+__all__ = [
+    "triton_allreduce_residual_rmsnorm",
+    "triton_allreduce_residual_rmsnorm_wrapper",
+]

@@ -1735,6 +1735,14 @@ def destroy_model_parallel():
         _PP.destroy()
     _PP = None
 
+    # Clean up Triton symmetric memory
+    try:
+        from sglang.srt.layers.triton_comm_fusion import cleanup_triton_symm_mem
+
+        cleanup_triton_symm_mem()
+    except ImportError:
+        pass
+
 
 def destroy_distributed_environment():
     global _WORLD
