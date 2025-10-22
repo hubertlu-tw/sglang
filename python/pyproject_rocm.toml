@@ -61,7 +61,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord2"]
+decord = ["decord2==2.0.0"]
 test = [
   "accelerate",
   "expecttest",
@@ -144,7 +144,7 @@ tracing = [
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [tool.setuptools.package-data]
-"sglang-rocm" = [
+"sglang" = [
   "srt/layers/moe/fused_moe_triton/configs/*/*.json",
   "srt/layers/quantization/configs/*.json",
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
