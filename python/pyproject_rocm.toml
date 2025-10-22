@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang-rocm"
+name = "sglang"
 version = "0.5.3"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
@@ -61,6 +61,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+decord = ["decord2"]
 test = [
   "accelerate",
   "expecttest",
@@ -80,7 +81,7 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
-630 = [
+rocm630 = [
     "torch @ https://download.pytorch.org/whl/rocm6.4/torch-2.9.0%2Brocm6.4-cp310-cp310-manylinux_2_28_x86_64.whl ; python_version == '3.10'",
     "torch @ https://download.pytorch.org/whl/rocm6.4/torch-2.9.0%2Brocm6.4-cp311-cp311-manylinux_2_28_x86_64.whl ; python_version == '3.11'",
     "torch @ https://download.pytorch.org/whl/rocm6.4/torch-2.9.0%2Brocm6.4-cp312-cp312-manylinux_2_28_x86_64.whl ; python_version == '3.12'",
@@ -103,7 +104,7 @@ tracing = [
     "xgrammar==0.1.25"
 ]
 
-700 = [
+rocm700 = [
     "torch @ https://download.pytorch.org/whl/nightly/rocm7.0/torch-2.10.0.dev20251011%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl ; python_version == '3.10'",
     "torch @ https://download.pytorch.org/whl/nightly/rocm7.0/torch-2.10.0.dev20251011%2Brocm7.0-cp311-cp311-manylinux_2_28_x86_64.whl ; python_version == '3.11'",
     "torch @ https://download.pytorch.org/whl/nightly/rocm7.0/torch-2.10.0.dev20251011%2Brocm7.0-cp312-cp312-manylinux_2_28_x86_64.whl ; python_version == '3.12'",
