@@ -61,7 +61,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord2==2.0.0"]
 test = [
   "accelerate",
   "expecttest",
@@ -106,7 +105,6 @@ tracing = [
 
 630_all = [
   "sglang-rocm[test]",
-  "sglang-rocm[decord]",
   "sglang-rocm[630]"
 ]
 
@@ -135,7 +133,6 @@ tracing = [
 
 700_all = [
   "sglang-rocm[test]",
-  "sglang-rocm[decord]",
   "sglang-rocm[700]"
 ]
 
