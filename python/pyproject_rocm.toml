@@ -105,9 +105,9 @@ tracing = [
 ]
 
 630_all = [
-  "sglang[test]",
-  "sglang[decord]",
-  "sglang[630]"
+  "sglang-rocm[test]",
+  "sglang-rocm[decord]",
+  "sglang-rocm[630]"
 ]
 
 700 = [
@@ -134,9 +134,9 @@ tracing = [
 ]
 
 700_all = [
-  "sglang[test]",
-  "sglang[decord]",
-  "sglang[700]"
+  "sglang-rocm[test]",
+  "sglang-rocm[decord]",
+  "sglang-rocm[700]"
 ]
 
 [project.urls]
