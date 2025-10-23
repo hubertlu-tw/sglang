@@ -557,43 +557,67 @@ def lightweight_barrier(
 
 @triton.jit
 def triton_allreduce_residual_rmsnorm_kernel(
-    # This is the CORRECT baseline kernel
+    # Pointers to data
     input_ptr,
     residual_ptr,
     weight_ptr,
     output_ptr,
+    residual_out_ptr,  # NEW: Output pointer for updated residual
+    # Pointers for communication
     symm_mem_buffer_ptrs,
     symm_mem_signal_pad_ptrs,
+    # Matrix dimensions
     M,
     N,
+    # Strides
     stride_im,
     stride_in,
     stride_rm,
     stride_rn,
     stride_om,
     stride_on,
+    stride_rom,
+    stride_ron,  # NEW: Strides for residual output
+    # Meta-parameters
     eps,
     rank: tl.constexpr,
     world_size: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
+    """
+    Fuses All-Reduce, Residual Add, and RMSNorm using symmetric memory for communication.
+    The kernel operates in phases:
+    1. Copy: Each rank copies its local input tensor into its symmetric memory buffer.
+    2. Sync: A barrier synchronizes all ranks to ensure copies are complete.
+    3. Compute: Each rank computes the result for a subset of rows.
+        a. All-Reduce: Sums values from all ranks' symmetric memory buffers.
+        b. Residual Add: Adds the residual tensor.
+        c. RMSNorm: Applies RMS normalization.
+    4. Sync: A final barrier ensures all computations are finished before exiting.
+
+    This kernel uses a grid-striding loop over the rows (M dimension) to handle
+    any number of rows with a fixed-size grid.
+    """
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
 
-    # Phase 1: Copy
+    # --- Phase 1: Copy local input to symmetric memory ---
     buffer_ptrs = symm_mem_buffer_ptrs.to(tl.pointer_type(tl.uint64))
     local_symm_mem_ptr = tl.load(buffer_ptrs + rank).to(
         tl.pointer_type(input_ptr.dtype.element_ty)
     )
     local_symm_mem_ptr = tl.multiple_of(local_symm_mem_ptr, 16)
+
     col_offsets = tl.arange(0, BLOCK_SIZE_N)
 
+    # Grid-striding loop to copy this program's assigned rows
     row_idx_copy = pid
     while row_idx_copy < M:
         row_input_ptr = input_ptr + row_idx_copy * stride_im
         input_vals = tl.load(
             row_input_ptr + col_offsets * stride_in, mask=col_offsets < N, other=0.0
         )
+        # Assuming symm mem is laid out contiguously like the tensor
         tl.store(
             local_symm_mem_ptr + row_idx_copy * N + col_offsets,
             input_vals,
@@ -601,15 +625,17 @@ def triton_allreduce_residual_rmsnorm_kernel(
         )
         row_idx_copy += num_programs
 
-    # Phase 2: CORRECT cross-GPU synchronization
+    # --- Phase 2: Synchronize all ranks ---
+    # All programs on all ranks must finish copying before proceeding.
     block_id = pid
     blockwise_barrier(
         symm_mem_signal_pad_ptrs, block_id, rank, world_size, sem="acq_rel"
     )
 
-    # Phase 3: Compute
+    # --- Phase 3: Compute All-Reduce, Residual, RMSNorm ---
     row_idx_compute = pid
     while row_idx_compute < M:
+        # All-Reduce from symmetric memory for the current row
         acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
         for i in tl.static_range(world_size):
             peer_symm_mem_ptr = tl.load(buffer_ptrs + i).to(
@@ -623,20 +649,32 @@ def triton_allreduce_residual_rmsnorm_kernel(
             )
             acc += peer_vals.to(tl.float32)
 
+        # Fuse Residual Add
         row_residual_ptr = residual_ptr + row_idx_compute * stride_rm
         residual_vals = tl.load(
             row_residual_ptr + col_offsets * stride_rn, mask=col_offsets < N, other=0.0
         )
         acc += residual_vals.to(tl.float32)
 
+        # Store updated residual (allreduced input + residual)
+        row_residual_out_ptr = residual_out_ptr + row_idx_compute * stride_rom
+        tl.store(
+            row_residual_out_ptr + col_offsets * stride_ron,
+            acc.to(residual_out_ptr.dtype.element_ty),
+            mask=col_offsets < N,
+        )
+
+        # Fuse RMSNorm
         acc_for_var = tl.where(col_offsets < N, acc, 0.0)
         variance = tl.sum(acc_for_var * acc_for_var, axis=0) / N
         rrms = tl.math.rsqrt(variance + eps)
 
         norm_acc = acc * rrms
+
         weight_vals = tl.load(weight_ptr + col_offsets, mask=col_offsets < N)
         output_vals = norm_acc * weight_vals
 
+        # Store final output
         row_output_ptr = output_ptr + row_idx_compute * stride_om
         tl.store(
             row_output_ptr + col_offsets * stride_on,
@@ -646,7 +684,7 @@ def triton_allreduce_residual_rmsnorm_kernel(
 
         row_idx_compute += num_programs
 
-    # Phase 4: Final barrier
+    # --- Phase 4: Final barrier ---
     tl.debug_barrier()
     blockwise_barrier(
         symm_mem_signal_pad_ptrs, block_id, rank, world_size, sem="acq_rel"
@@ -660,16 +698,23 @@ def triton_allreduce_residual_rmsnorm_kernel_with_delay(
     residual_ptr,
     weight_ptr,
     output_ptr,
+    residual_out_ptr,  # NEW: Output pointer for updated residual
+    # Pointers for communication
     symm_mem_buffer_ptrs,
     symm_mem_signal_pad_ptrs,
+    # Matrix dimensions
     M,
     N,
+    # Strides
     stride_im,
     stride_in,
     stride_rm,
     stride_rn,
     stride_om,
     stride_on,
+    stride_rom,
+    stride_ron,  # NEW: Strides for residual output
+    # Meta-parameters
     eps,
     rank: tl.constexpr,
     world_size: tl.constexpr,
@@ -678,7 +723,7 @@ def triton_allreduce_residual_rmsnorm_kernel_with_delay(
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
 
-    # Phase 1: Copy
+    # --- Phase 1: Copy ---
     buffer_ptrs = symm_mem_buffer_ptrs.to(tl.pointer_type(tl.uint64))
     local_symm_mem_ptr = tl.load(buffer_ptrs + rank).to(
         tl.pointer_type(input_ptr.dtype.element_ty)
@@ -715,10 +760,10 @@ def triton_allreduce_residual_rmsnorm_kernel_with_delay(
             )
         row_idx_copy += num_programs
 
-    # Phase 2: FLAWED intra-GPU synchronization
+    # --- Phase 2: FLAWED intra-GPU synchronization ---
     tl.debug_barrier()
 
-    # Phase 3: Compute
+    # --- Phase 3: Compute ---
     # Other ranks will NOT wait for rank 1 and will read its incomplete/garbage data
     row_idx_compute = pid
     while row_idx_compute < M:
@@ -741,14 +786,25 @@ def triton_allreduce_residual_rmsnorm_kernel_with_delay(
         )
         acc += residual_vals.to(tl.float32)
 
+        # Store updated residual (allreduced input + residual)
+        row_residual_out_ptr = residual_out_ptr + row_idx_compute * stride_rom
+        tl.store(
+            row_residual_out_ptr + col_offsets * stride_ron,
+            acc.to(residual_out_ptr.dtype.element_ty),
+            mask=col_offsets < N,
+        )
+
+        # Fuse RMSNorm
         acc_for_var = tl.where(col_offsets < N, acc, 0.0)
         variance = tl.sum(acc_for_var * acc_for_var, axis=0) / N
         rrms = tl.math.rsqrt(variance + eps)
 
         norm_acc = acc * rrms
+
         weight_vals = tl.load(weight_ptr + col_offsets, mask=col_offsets < N)
         output_vals = norm_acc * weight_vals
 
+        # Store final output
         row_output_ptr = output_ptr + row_idx_compute * stride_om
         tl.store(
             row_output_ptr + col_offsets * stride_on,
@@ -758,7 +814,7 @@ def triton_allreduce_residual_rmsnorm_kernel_with_delay(
 
         row_idx_compute += num_programs
 
-    # Phase 4: Final flawed barrier
+    # --- Phase 4: Final flawed barrier ---
     tl.debug_barrier()
 
 
@@ -769,6 +825,7 @@ def triton_allreduce_residual_rmsnorm_kernel_optimized_correct(
     residual_ptr,
     weight_ptr,
     output_ptr,
+    residual_out_ptr,  # NEW: Output pointer for updated residual
     # Pointers for communication
     symm_mem_buffer_ptrs,
     symm_mem_signal_pad_ptrs,
@@ -782,6 +839,8 @@ def triton_allreduce_residual_rmsnorm_kernel_optimized_correct(
     stride_rn,
     stride_om,
     stride_on,
+    stride_rom,
+    stride_ron,  # NEW: Strides for residual output
     # Meta-parameters
     eps,
     rank: tl.constexpr,
@@ -790,14 +849,6 @@ def triton_allreduce_residual_rmsnorm_kernel_optimized_correct(
 ):
     """
     Highly optimized version with advanced optimizations while maintaining correctness.
-
-    Key optimizations:
-    1. Maintains proper cross-GPU synchronization with blockwise_barrier
-    2. Loop unrolling for better instruction-level parallelism
-    3. Prefetching and pipelining for memory latency hiding
-    4. Vectorized memory operations with optimal alignment
-    5. Reduced pointer arithmetic overhead
-    6. Optimized variance computation with fused operations
     """
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
@@ -873,6 +924,14 @@ def triton_allreduce_residual_rmsnorm_kernel_optimized_correct(
         )
         acc += residual_vals.to(tl.float32)
 
+        # Store updated residual (allreduced input + residual)
+        residual_out_offset = row_idx_compute * stride_rom
+        tl.store(
+            residual_out_ptr + residual_out_offset + col_offsets * stride_ron,
+            acc.to(residual_out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
         # Optimized RMSNorm with fused operations
         # Compute variance more efficiently
         masked_acc = tl.where(mask, acc, 0.0)
@@ -911,6 +970,7 @@ def triton_allreduce_residual_rmsnorm_kernel_multi_gpu_optimized(
     residual_ptr,
     weight_ptr,
     output_ptr,
+    residual_out_ptr,  # NEW: Output pointer for updated residual
     # Pointers for communication
     symm_mem_buffer_ptrs,
     symm_mem_signal_pad_ptrs,
@@ -924,6 +984,8 @@ def triton_allreduce_residual_rmsnorm_kernel_multi_gpu_optimized(
     stride_rn,
     stride_om,
     stride_on,
+    stride_rom,
+    stride_ron,  # NEW: Strides for residual output
     # Meta-parameters
     eps,
     rank: tl.constexpr,
@@ -932,11 +994,6 @@ def triton_allreduce_residual_rmsnorm_kernel_multi_gpu_optimized(
 ):
     """
     Multi-GPU optimized version that reduces barrier overhead.
-
-    Key optimizations for multi-GPU:
-    1. Batch multiple rows per program to amortize barrier cost
-    2. Use larger blocks to reduce total number of barriers
-    3. Optimized memory access patterns for better throughput
     """
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
@@ -1035,6 +1092,14 @@ def triton_allreduce_residual_rmsnorm_kernel_multi_gpu_optimized(
             )
             acc += residual_vals.to(tl.float32)
 
+            # Store updated residual (allreduced input + residual)
+            residual_out_offset = row_idx * stride_rom
+            tl.store(
+                residual_out_ptr + residual_out_offset + col_offsets * stride_ron,
+                acc.to(residual_out_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
             # RMSNorm
             masked_acc = tl.where(mask, acc, 0.0)
             variance = tl.sum(masked_acc * masked_acc, axis=0) / N
@@ -1086,6 +1151,14 @@ def triton_allreduce_residual_rmsnorm_kernel_multi_gpu_optimized(
                 )
                 acc += residual_vals.to(tl.float32)
 
+                # Store updated residual (allreduced input + residual)
+                residual_out_offset = current_row * stride_rom
+                tl.store(
+                    residual_out_ptr + residual_out_offset + col_offsets * stride_ron,
+                    acc.to(residual_out_ptr.dtype.element_ty),
+                    mask=mask,
+                )
+
                 # RMSNorm
                 masked_acc = tl.where(mask, acc, 0.0)
                 variance = tl.sum(masked_acc * masked_acc, axis=0) / N
@@ -1103,7 +1176,6 @@ def triton_allreduce_residual_rmsnorm_kernel_multi_gpu_optimized(
                     output_vals.to(output_ptr.dtype.element_ty),
                     mask=mask,
                 )
-
         row_idx_compute += num_programs * ROWS_PER_BLOCK
 
     # --- Phase 4: Final synchronization ---
@@ -1120,11 +1192,15 @@ def triton_allreduce_residual_rmsnorm(
     symm_mem_buffer: torch.Tensor,
     group: str,  # Changed from group_name to accept either string or ProcessGroup
     use_delayed_kernel: bool = False,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:  # UPDATED: Return both outputs
     """
     Python wrapper for the fused All-Reduce, Residual Add, and RMSNorm Triton kernel.
     """
     # Input validation
+    # Move weight to the same device and dtype as input if needed
+    if weight.device != input.device or weight.dtype != input.dtype:
+        weight = weight.to(device=input.device, dtype=input.dtype)
+
     assert input.is_cuda and residual.is_cuda and weight.is_cuda
     assert (
         input.is_contiguous() and residual.is_contiguous()
@@ -1138,6 +1214,7 @@ def triton_allreduce_residual_rmsnorm(
 
     M, N = input.shape
     output = torch.empty_like(input)
+    residual_out = torch.empty_like(input)  # NEW: Output tensor for residual
 
     # Handle GroupCoordinator objects by extracting the device_group
     if hasattr(group, "device_group"):
@@ -1193,6 +1270,7 @@ def triton_allreduce_residual_rmsnorm(
         residual,
         weight,
         output,
+        residual_out,  # NEW: Pass residual output tensor
         symm_mem_hdl.buffer_ptrs_dev,
         symm_mem_hdl.signal_pad_ptrs_dev,
         M,
@@ -1203,6 +1281,8 @@ def triton_allreduce_residual_rmsnorm(
         residual.stride(1),
         output.stride(0),
         output.stride(1),
+        residual_out.stride(0),
+        residual_out.stride(1),  # NEW: Residual output strides
         eps,
         rank=symm_mem_hdl.rank,
         world_size=symm_mem_hdl.world_size,
@@ -1210,7 +1290,7 @@ def triton_allreduce_residual_rmsnorm(
         num_warps=num_warps,
     )
     symm_mem_hdl.barrier()  # TODO: remove this as it does not improve accuracy
-    return output
+    return output, residual_out  # UPDATED: Return both outputs
 
 
 # Fake implementation for when custom op is not supported
@@ -1234,7 +1314,7 @@ def fake_triton_allreduce_residual_rmsnorm_wrapper(
     weight: torch.Tensor,
     eps: float,
     max_token_num: int,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation for the wrapper function when custom op is not supported."""
     return None
 
@@ -1246,7 +1326,7 @@ def triton_allreduce_residual_rmsnorm_wrapper(
     weight: torch.Tensor,
     eps: float,
     max_token_num: int,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Wrapper function that provides the simplified interface expected by RMSNorm layer.
 
@@ -1255,6 +1335,7 @@ def triton_allreduce_residual_rmsnorm_wrapper(
     2. Gets the symmetric memory buffer from the global manager
     3. Gets the process group from the distributed environment
     4. Calls the actual triton_allreduce_residual_rmsnorm function
+    5. Returns both the normalized output and the updated residual
     """
     from sglang.srt.distributed import get_tensor_model_parallel_group
     from sglang.srt.layers.triton_comm_manager import get_triton_symm_mem_buffer
@@ -1275,7 +1356,7 @@ def triton_allreduce_residual_rmsnorm_wrapper(
         group = "default_triton_group"
 
     # Call the actual function with proper parameters
-    return triton_allreduce_residual_rmsnorm(
+    norm_output, residual_out = triton_allreduce_residual_rmsnorm(
         input=input_tensor,
         residual=residual,
         weight=weight,
@@ -1284,6 +1365,12 @@ def triton_allreduce_residual_rmsnorm_wrapper(
         group=group,
         use_delayed_kernel=False,
     )
+
+    if norm_output is None:
+        return None
+
+    # REMOVED: No need for separate allreduce - the kernel now handles it
+    return norm_output, residual_out
 
 
 # Register as custom op if supported

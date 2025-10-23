@@ -314,7 +314,10 @@ class RMSNorm(CustomOp):
                         logger.debug(
                             f"Triton fused allreduce succeeded for shape {x.shape}"
                         )
-                        return fused_result, residual
+                        # The wrapper returns (norm_output, residual_out)
+                        # Unpack the tuple properly
+                        norm_output, residual_out = fused_result
+                        return norm_output, residual_out
                     else:
                         logger.debug(
                             f"Triton fused allreduce failed, falling back for shape {x.shape}"
