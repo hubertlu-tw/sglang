@@ -18,7 +18,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
+from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -423,7 +423,7 @@ class CustomAllreduce:
 
 def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
-    if is_hip():
+    if is_hip() and get_bool_env_var("USE_AITER_CAR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
