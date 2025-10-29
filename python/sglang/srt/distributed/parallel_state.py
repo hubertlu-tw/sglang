@@ -347,7 +347,8 @@ class GroupCoordinator:
             else:
                 ca_max_size = 8 * 1024 * 1024
             try:
-                self.ca_comm = dispatch_custom_allreduce(
+                CAClass = dispatch_custom_allreduce()
+                self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
                     max_size=ca_max_size,
