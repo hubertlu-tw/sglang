@@ -555,7 +555,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states = layernorm(hidden_states)
+                    # Handle variable return values from quantized layernorm
+                    result = layernorm(hidden_states)
+                    hidden_states = result[0] if isinstance(result, (tuple, list)) else result
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
@@ -566,7 +568,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
                 if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
+                    # Handle variable return values from quantized layernorm
+                    result = layernorm(hidden_states)
+                    hidden_states = result[0] if isinstance(result, (tuple, list)) else result
         else:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
@@ -584,7 +588,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                # Handle variable return values from quantized layernorm
+                result = layernorm(hidden_states, residual)
+                hidden_states = result[0] if isinstance(result, (tuple, list)) else result
+                residual = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else residual
         return hidden_states, residual
 
     @staticmethod
