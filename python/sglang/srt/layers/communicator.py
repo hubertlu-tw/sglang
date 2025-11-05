@@ -279,8 +279,14 @@ class LayerCommunicator:
                             None,
                         )
                         # Extract first two values, ignore any additional return values
-                        hidden_states = result[0] if isinstance(result, (tuple, list)) else result
-                        residual = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else None
+                        hidden_states = (
+                            result[0] if isinstance(result, (tuple, list)) else result
+                        )
+                        residual = (
+                            result[1]
+                            if isinstance(result, (tuple, list)) and len(result) > 1
+                            else None
+                        )
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
@@ -296,8 +302,14 @@ class LayerCommunicator:
                             None,
                         )
                         # Extract first two values, ignore any additional return values
-                        hidden_states = result[0] if isinstance(result, (tuple, list)) else result
-                        residual = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else None
+                        hidden_states = (
+                            result[0] if isinstance(result, (tuple, list)) else result
+                        )
+                        residual = (
+                            result[1]
+                            if isinstance(result, (tuple, list)) and len(result) > 1
+                            else None
+                        )
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
 
@@ -557,7 +569,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 ):
                     # Handle variable return values from quantized layernorm
                     result = layernorm(hidden_states)
-                    hidden_states = result[0] if isinstance(result, (tuple, list)) else result
+                    hidden_states = (
+                        result[0] if isinstance(result, (tuple, list)) else result
+                    )
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
@@ -570,7 +584,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     # Handle variable return values from quantized layernorm
                     result = layernorm(hidden_states)
-                    hidden_states = result[0] if isinstance(result, (tuple, list)) else result
+                    hidden_states = (
+                        result[0] if isinstance(result, (tuple, list)) else result
+                    )
         else:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
@@ -590,8 +606,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 # Handle variable return values from quantized layernorm
                 result = layernorm(hidden_states, residual)
-                hidden_states = result[0] if isinstance(result, (tuple, list)) else result
-                residual = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else residual
+                hidden_states = (
+                    result[0] if isinstance(result, (tuple, list)) else result
+                )
+                residual = (
+                    result[1]
+                    if isinstance(result, (tuple, list)) and len(result) > 1
+                    else residual
+                )
         return hidden_states, residual
 
     @staticmethod

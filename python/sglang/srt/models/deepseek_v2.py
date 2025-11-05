@@ -1367,7 +1367,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
             # Check if the first element is a tensor with shape attribute
-            if len(hidden_states) > 0 and hasattr(hidden_states[0], 'shape') and hidden_states[0].shape[0] == 0:
+            if (
+                len(hidden_states) > 0
+                and hasattr(hidden_states[0], "shape")
+                and hidden_states[0].shape[0] == 0
+            ):
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
@@ -1558,7 +1562,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     # Extract first two values, ignore any additional return values
                     q = result[0] if isinstance(result, (tuple, list)) else result
-                    k_nope = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else k_nope
+                    k_nope = (
+                        result[1]
+                        if isinstance(result, (tuple, list)) and len(result) > 1
+                        else k_nope
+                    )
                 else:
                     q = self.q_a_layernorm(q)
                     k_nope = self.kv_a_layernorm(k_nope)
@@ -1883,7 +1891,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     # Extract first two values, ignore any additional return values
                     q = result[0] if isinstance(result, (tuple, list)) else result
-                    k_nope = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else k_nope
+                    k_nope = (
+                        result[1]
+                        if isinstance(result, (tuple, list)) and len(result) > 1
+                        else k_nope
+                    )
                 else:
                     q = self.q_a_layernorm(q)
                     k_nope = self.kv_a_layernorm(k_nope)
