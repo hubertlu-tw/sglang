@@ -268,7 +268,8 @@ class LayerCommunicator:
                     residual = hidden_states
 
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
-                        hidden_states = fused_rms_mxfp4_quant(
+                        # Use robust unpacking to handle variable return values from fused_rms_mxfp4_quant
+                        result = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
                             self.input_layernorm.variance_epsilon,
@@ -277,23 +278,28 @@ class LayerCommunicator:
                             None,
                             None,
                         )
+                        # Extract first two values, ignore any additional return values
+                        hidden_states = result[0] if isinstance(result, (tuple, list)) else result
+                        residual = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else None
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
-                        hidden_states, residual = fused_rms_mxfp4_quant(
+                        # Use robust unpacking to handle variable return values from fused_rms_mxfp4_quant
+                        result = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
                             self.input_layernorm.variance_epsilon,
                             None,
                             None,
                             None,
-                            residual,
+                            None,
                         )
+                        # Extract first two values, ignore any additional return values
+                        hidden_states = result[0] if isinstance(result, (tuple, list)) else result
+                        residual = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else None
                     else:
-                        hidden_states, residual = self.input_layernorm(
-                            hidden_states, residual
-                        )
+                        hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
