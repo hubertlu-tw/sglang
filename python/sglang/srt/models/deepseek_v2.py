@@ -1547,8 +1547,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    # FIXED: Use robust unpacking for fused_rms_mxfp4_quant
-                    q, k_nope = fused_rms_mxfp4_quant(
+                    # Use robust unpacking to handle variable return values from fused_rms_mxfp4_quant
+                    result = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.variance_epsilon,
@@ -1556,6 +1556,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.weight,
                         self.kv_a_layernorm.variance_epsilon,
                     )
+                    # Extract first two values, ignore any additional return values
+                    q = result[0] if isinstance(result, (tuple, list)) else result
+                    k_nope = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else k_nope
                 else:
                     q = self.q_a_layernorm(q)
                     k_nope = self.kv_a_layernorm(k_nope)
@@ -1869,7 +1872,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope = fused_rms_mxfp4_quant(
+                    # Use robust unpacking to handle variable return values from fused_rms_mxfp4_quant
+                    result = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.variance_epsilon,
@@ -1877,6 +1881,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.weight,
                         self.kv_a_layernorm.variance_epsilon,
                     )
+                    # Extract first two values, ignore any additional return values
+                    q = result[0] if isinstance(result, (tuple, list)) else result
+                    k_nope = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else k_nope
                 else:
                     q = self.q_a_layernorm(q)
                     k_nope = self.kv_a_layernorm(k_nope)
