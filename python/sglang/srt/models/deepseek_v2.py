@@ -1366,69 +1366,62 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
-            if hidden_states[0].shape[0] == 0:
+            # Check if the first element is a tensor with shape attribute
+            if len(hidden_states) > 0 and hasattr(hidden_states[0], 'shape') and hidden_states[0].shape[0] == 0:
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states[0]
+            # Extract the actual tensor from the tuple for normal processing
+            hidden_states_tensor = hidden_states[0]
         else:
             if hidden_states.shape[0] == 0:
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states, None, forward_batch, None
+            hidden_states_tensor = hidden_states
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states_tensor, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states_tensor, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states_tensor, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             if not self.is_mla_preprocess_enabled:
                 inner_state = self.forward_absorb_prepare(
-                    positions, hidden_states, forward_batch, zero_allocator
+                    positions, hidden_states_tensor, forward_batch, zero_allocator
                 )
             else:
-                # TODO(iforgetmyname): to be separated as a standalone func
-                if self.mla_preprocess is None:
-                    self.mla_preprocess = NPUFusedMLAPreprocess(
-                        self.fused_qkv_a_proj_with_mqa,
-                        self.q_a_layernorm,
-                        self.kv_a_layernorm,
-                        self.q_b_proj,
-                        self.w_kc,
-                        self.rotary_emb,
-                        self.layer_id,
-                        self.num_local_heads,
-                        self.qk_nope_head_dim,
-                        self.qk_rope_head_dim,
-                    )
-                inner_state = self.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
+                inner_state = self.forward_absorb_fused_mla_rope_prepare(
+                    positions, hidden_states_tensor, forward_batch, zero_allocator
                 )
-                inner_state = (*inner_state, None)  # add a position for topk_indices
-        elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
+        elif attn_forward_method == AttnForwardMethod.MLA_CPU:
+            inner_state = self.forward_absorb_fused_mla_rope_cpu_prepare(
+                positions, hidden_states_tensor, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.NPU_SPARSE:
             inner_state = self.forward_npu_sparse_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states_tensor, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states_tensor, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
             inner_state = self.forward_absorb_fused_mla_rope_cpu_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states_tensor, forward_batch, zero_allocator
             )
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"{attn_forward_method=}")
         return None, attn_forward_method, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
@@ -1446,7 +1439,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
-        elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
+        elif attn_forward_method == AttnForwardMethod.NPU_SPARSE:
             return self.forward_npu_sparse_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
@@ -1554,6 +1547,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
+                    # FIXED: Use robust unpacking for fused_rms_mxfp4_quant
                     q, k_nope = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
