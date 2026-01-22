@@ -16,7 +16,7 @@ Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](h
 docker pull lmsysorg/sglang:latest
 
 # MI350/MI355
-docker pull lmsysorg/sglang:dsv32-rocm
+docker pull rocm/sgl-dev:v0.5.7-rocm700-mi35x-20260119
 
 # NPUs
 docker pull lmsysorg/sglang:dsv32-a2
@@ -45,6 +45,11 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 
 # Launch with Pure TP
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
+
+# ROCm on MI350/MI355 GPUs
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
+
+#
 ```
 
 ### Configuration Tips
