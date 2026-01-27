@@ -47,6 +47,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
+    is_hip,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -750,6 +751,68 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
 
 
+def _init_fastsafetensors_loader(
+    pg,
+    device,
+    f_list,
+    *,
+    nogds: bool = False,
+    max_threads: Optional[int] = None,
+    bbuf_size_kb: Optional[int] = None,
+):
+    if max_threads is None:
+        max_threads_env = os.getenv("SGLANG_FASTSAFE_MAX_THREADS")
+        if max_threads_env:
+            try:
+                max_threads = int(max_threads_env)
+            except ValueError:
+                logger.warning(
+                    "Invalid SGLANG_FASTSAFE_MAX_THREADS=%r, ignoring.",
+                    max_threads_env,
+                )
+        elif is_hip():
+            # ROCm can hit HSA resource limits with many loader threads.
+            max_threads = 2
+
+    if bbuf_size_kb is None:
+        bbuf_env = os.getenv("SGLANG_FASTSAFE_BBUF_KB")
+        if bbuf_env:
+            try:
+                bbuf_size_kb = int(bbuf_env)
+            except ValueError:
+                logger.warning(
+                    "Invalid SGLANG_FASTSAFE_BBUF_KB=%r, ignoring.",
+                    bbuf_env,
+                )
+        elif is_hip():
+            # Smaller buffer reduces HSA resource pressure on ROCm.
+            bbuf_size_kb = 4096
+
+    if max_threads is None:
+        if bbuf_size_kb is None:
+            loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+        else:
+            loader = SafeTensorsFileLoader(
+                pg, device, nogds=nogds, bbuf_size_kb=bbuf_size_kb
+            )
+    else:
+        if bbuf_size_kb is None:
+            loader = SafeTensorsFileLoader(
+                pg, device, nogds=nogds, max_threads=max_threads
+            )
+        else:
+            loader = SafeTensorsFileLoader(
+                pg,
+                device,
+                nogds=nogds,
+                max_threads=max_threads,
+                bbuf_size_kb=bbuf_size_kb,
+            )
+    rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+    loader.add_filenames(rank_file_map)
+    return loader
+
+
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -783,24 +846,81 @@ def fastsafetensors_weights_iterator(
         "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
     )
 
+    nogds = is_hip()
+    max_copy_block_size = None
+    use_buf_register = None
+    if is_hip():
+        max_copy_block_size = 1024 * 1024 * 1024
+        use_buf_register = False
+    max_copy_env = os.getenv("SGLANG_FASTSAFE_MAX_COPY_MB")
+    if max_copy_env:
+        try:
+            max_copy_block_size = int(max_copy_env) * 1024 * 1024
+        except ValueError:
+            logger.warning(
+                "Invalid SGLANG_FASTSAFE_MAX_COPY_MB=%r, ignoring.",
+                max_copy_env,
+            )
+    use_buf_register_env = os.getenv("SGLANG_FASTSAFE_USE_BUF_REGISTER")
+    if use_buf_register_env:
+        try:
+            use_buf_register = bool(int(use_buf_register_env))
+        except ValueError:
+            logger.warning(
+                "Invalid SGLANG_FASTSAFE_USE_BUF_REGISTER=%r, ignoring.",
+                use_buf_register_env,
+            )
+
     for f_list in tqdm(
         weight_files_sub_lists,
         desc="Loading safetensors using Fastsafetensor loader",
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
-        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
-        loader.add_filenames(rank_file_map)
+        loader = _init_fastsafetensors_loader(
+            pg, device, f_list, nogds=nogds, max_threads=None
+        )
         try:
-            fb = loader.copy_files_to_device()
+            try:
+                copy_kwargs = {}
+                if max_copy_block_size is not None:
+                    copy_kwargs["max_copy_block_size"] = max_copy_block_size
+                if use_buf_register is not None:
+                    copy_kwargs["use_buf_register"] = use_buf_register
+                if copy_kwargs:
+                    fb = loader.copy_files_to_device(**copy_kwargs)
+                else:
+                    fb = loader.copy_files_to_device()
+            except RuntimeError as e:
+                if not nogds and "gds" in str(e).lower():
+                    loader.close()
+                    nogds = True
+                    logger.warning(
+                        "GDS not enabled, setting `nogds=True`.\n"
+                        "For more information, see: https://github.com/foundation-model-stack/fastsafetensors?tab=readme-ov-file#basic-api-usages"
+                    )
+                    loader = _init_fastsafetensors_loader(
+                        pg, device, f_list, nogds=nogds
+                    )
+                    copy_kwargs = {}
+                    if max_copy_block_size is not None:
+                        copy_kwargs["max_copy_block_size"] = max_copy_block_size
+                    if use_buf_register is not None:
+                        copy_kwargs["use_buf_register"] = use_buf_register
+                    if copy_kwargs:
+                        fb = loader.copy_files_to_device(**copy_kwargs)
+                    else:
+                        fb = loader.copy_files_to_device()
+                else:
+                    raise
+
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
                     t = fb.get_tensor(k)
                     yield k, t
             finally:
-                pass
+                fb.close()
         finally:
             loader.close()
 
