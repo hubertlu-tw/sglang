@@ -1724,11 +1724,39 @@ class NativeSparseAttnBackend(
 
         kv_indptr = self.kv_indptr
 
-        non_minus1_mask = page_table_1 != -1
-        non_minus1_counts = non_minus1_mask.sum(dim=1)
+        # CUDA-graph-safe implementation using custom Triton kernel to compact indices
+        from sglang.srt.layers.attention.nsa.compact_sparse_indices import (
+            compact_sparse_indices_triton,
+        )
+
+        # Calculate counts and cumsum for indptr
+        non_minus1_counts = (page_table_1 != -1).sum(dim=1).to(torch.int32)
         kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
-        kv_indices = page_table_1[page_table_1 != -1]
+        # Pre-allocate kv_indices buffer with maximum possible size (done once during init)
+        max_size = page_table_1.shape[0] * page_table_1.shape[1]
+        if (
+            not hasattr(self, "_aiter_kv_indices_buffer")
+            or self._aiter_kv_indices_buffer.shape[0] < max_size
+        ):
+            self._aiter_kv_indices_buffer = torch.empty(
+                max_size, dtype=torch.int32, device=self.device
+            )
+
+        # Compact the indices using Triton kernel (removes -1 values)
+        # This is CUDA-graph safe as it uses fixed-size buffers
+        compact_sparse_indices_triton(
+            page_table_1.to(torch.int32),
+            non_minus1_counts,
+            self._aiter_kv_indices_buffer,
+            bs,
+            page_table_1.shape[1],
+        )
+
+        # Pass the full pre-allocated buffer to mla_decode_fwd
+        # kv_indptr specifies the valid ranges, so the kernel will only read the compacted indices
+        # This avoids slicing with a tensor value (which would call .item() and break CUDA graphs)
+        kv_indices = self._aiter_kv_indices_buffer
 
         mla_decode_fwd(
             q.view(-1, layer.tp_q_head_num, layer.head_dim),
