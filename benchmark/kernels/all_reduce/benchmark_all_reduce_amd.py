@@ -20,21 +20,16 @@ Usage:
 """
 
 import argparse
+import json
 import os
 from contextlib import nullcontext
-from typing import List, Dict, Any, Callable, Tuple, Optional
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import init_distributed_environment
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_group,
-    graph_capture,
-    initialize_model_parallel,
-    set_custom_all_reduce,
-)
-from sglang.srt.utils import is_hip
 from sglang.srt.distributed.device_communicators.custom_all_reduce import (
     CustomAllreduce as SGLCustomAllreduce,
 )
@@ -42,6 +37,13 @@ from sglang.srt.distributed.device_communicators.quick_all_reduce import (
     QuickAllReduce,
     qr_rocm_arch_available,
 )
+from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_group,
+    graph_capture,
+    initialize_model_parallel,
+    set_custom_all_reduce,
+)
+from sglang.srt.utils import is_hip
 
 _CUSTOM_AR_MIN_BYTES = 32 * 1024
 
@@ -54,7 +56,7 @@ IS_CI = (
 
 class AllReduceBenchmark:
     """Comprehensive all-reduce benchmark class"""
-    
+
     def __init__(self, world_size: int, rank: int, device: torch.device):
         self.world_size = world_size
         self.rank = rank
@@ -65,19 +67,19 @@ class AllReduceBenchmark:
         self.custom_ar_group = None
         self.invalid_impls = set()
         self.initialized = False
-        
+
     def initialize_communicators(self, max_size_bytes: int):
         """Initialize all available communicators"""
         if self.initialized:
             return
-            
+
         # Set device
         torch.cuda.set_device(self.rank % torch.cuda.device_count())
-        
+
         # Disable GroupCoordinator custom AR to avoid duplicate instances.
         # We'll create sgl/aiter custom ARs explicitly for benchmarking.
         set_custom_all_reduce(False)
-        
+
         # Initialize distributed environment
         init_distributed_environment(
             world_size=self.world_size,
@@ -85,10 +87,10 @@ class AllReduceBenchmark:
             local_rank=self.rank % torch.cuda.device_count(),
         )
         initialize_model_parallel(tensor_model_parallel_size=self.world_size)
-        
+
         group = get_tensor_model_parallel_group()
         self.group = group
-        
+
         # Base communicators from group
         self.communicators["torch_native"] = group.device_group
         self.communicators["pynccl"] = group.pynccl_comm
@@ -166,10 +168,12 @@ class AllReduceBenchmark:
                 and "custom_ar_aiter" not in self.invalid_impls
             ):
                 self.group.ca_comm = self.communicators["custom_ar_aiter"]
-        
+
         self.initialized = True
 
-    def _validate_custom_ar(self, impl_name: str, device_group: dist.ProcessGroup) -> bool:
+    def _validate_custom_ar(
+        self, impl_name: str, device_group: dist.ProcessGroup
+    ) -> bool:
         """Validate custom AR against torch_native on a small tensor."""
         try:
             tensor_elems = max(_CUSTOM_AR_MIN_BYTES, 32 * 1024) // 2
@@ -199,28 +203,33 @@ class AllReduceBenchmark:
                     details.append(f"full_nvlink={getattr(comm, 'full_nvlink', None)}")
                     details.append(f"max_size={getattr(comm, 'max_size', None)}")
                     try:
-                        details.append(f"should_custom_ar={comm.should_custom_ar(test)}")
+                        details.append(
+                            f"should_custom_ar={comm.should_custom_ar(test)}"
+                        )
                     except Exception:
                         details.append("should_custom_ar=<error>")
                 detail_str = ", ".join(details) if details else "no_comm_details"
                 print(f"Info: {impl_name} validation error: {e} ({detail_str})")
             return False
-        
+
     def get_implementation_function(self, impl_name: str) -> Callable:
         """Get the appropriate all-reduce function for the implementation"""
         comm = self.communicators.get(impl_name)
-        
+
         if impl_name == "torch_native":
+
             def torch_allreduce(tensor: torch.Tensor) -> torch.Tensor:
                 dist.all_reduce(tensor, group=comm)
                 return tensor
+
             return torch_allreduce
-            
+
         elif impl_name == "custom_ar_sgl":
+
             def custom_allreduce(tensor: torch.Tensor) -> torch.Tensor:
                 if impl_name in self.invalid_impls:
                     raise RuntimeError("custom_ar_sgl failed validation")
-                if comm is None or (hasattr(comm, 'disabled') and comm.disabled):
+                if comm is None or (hasattr(comm, "disabled") and comm.disabled):
                     raise RuntimeError("custom_ar_sgl communicator is not available")
                 if hasattr(comm, "all_reduce_unreg"):
                     result = comm.all_reduce_unreg(tensor)
@@ -229,13 +238,15 @@ class AllReduceBenchmark:
                 if result is None:
                     raise RuntimeError("custom_ar_sgl cannot handle this tensor")
                 return result
+
             return custom_allreduce
 
         elif impl_name == "custom_ar_aiter":
+
             def aiter_custom_allreduce(tensor: torch.Tensor) -> torch.Tensor:
                 if impl_name in self.invalid_impls:
                     raise RuntimeError("custom_ar_aiter failed validation")
-                if comm is None or (hasattr(comm, 'disabled') and comm.disabled):
+                if comm is None or (hasattr(comm, "disabled") and comm.disabled):
                     raise RuntimeError("custom_ar_aiter communicator is not available")
                 if hasattr(comm, "all_reduce_unreg"):
                     result = comm.all_reduce_unreg(tensor)
@@ -244,8 +255,9 @@ class AllReduceBenchmark:
                 if result is None:
                     raise RuntimeError("custom_ar_aiter cannot handle this tensor")
                 return result
+
             return aiter_custom_allreduce
-            
+
         elif impl_name.startswith("quick_ar_"):
             mode = impl_name.split("_", 2)[2].lower()
 
@@ -256,8 +268,9 @@ class AllReduceBenchmark:
                 return qcomm.quick_all_reduce(tensor)
 
             return quick_allreduce
-            
+
         elif impl_name == "pynccl":
+
             def pynccl_allreduce(tensor: torch.Tensor) -> torch.Tensor:
                 if comm is None:
                     raise RuntimeError("pynccl communicator is not available")
@@ -265,9 +278,11 @@ class AllReduceBenchmark:
                 with comm.change_state(enable=True, stream=torch.cuda.current_stream()):
                     comm.all_reduce(result)
                 return result
+
             return pynccl_allreduce
-            
+
         elif impl_name == "inplace_all_reduce":
+
             def inplace_allreduce(tensor: torch.Tensor) -> torch.Tensor:
                 if self.group is None:
                     raise RuntimeError("inplace_all_reduce group is not initialized")
@@ -275,63 +290,103 @@ class AllReduceBenchmark:
                     tensor, group_name=self.group.unique_name
                 )
                 return tensor
+
             return inplace_allreduce
-            
+
         else:
             raise ValueError(f"Unknown implementation: {impl_name}")
-    
-    def benchmark_eager_mode(self, impl_name: str, tensor: torch.Tensor, 
-                           warmup_iters: int = 5, test_iters: int = 20) -> Tuple[torch.Tensor, float]:
+
+    def impl_supports_tensor(self, impl_name: str, tensor: torch.Tensor) -> bool:
+        """Check if an implementation should be used for a tensor size."""
+        if impl_name.startswith("quick_ar_"):
+            mode = impl_name.split("_", 2)[2].lower()
+            qcomm = self.quick_ar_comms.get(mode)
+            if qcomm is None or getattr(qcomm, "disabled", False):
+                return False
+            if hasattr(qcomm, "should_quick_allreduce"):
+                return qcomm.should_quick_allreduce(tensor)
+            return True
+        if impl_name in ("custom_ar_sgl", "custom_ar_aiter"):
+            comm = self.communicators.get(impl_name)
+            if comm is None or getattr(comm, "disabled", False):
+                return False
+            if hasattr(comm, "should_custom_ar"):
+                return comm.should_custom_ar(tensor)
+            return True
+        if impl_name == "pynccl":
+            if self.group is None:
+                return False
+            if hasattr(self.group, "is_symmetric_memory_enabled"):
+                return self.group.is_symmetric_memory_enabled()
+            return True
+        if impl_name in ("torch_native", "inplace_all_reduce"):
+            return True
+        return True
+
+    def benchmark_eager_mode(
+        self,
+        impl_name: str,
+        tensor: torch.Tensor,
+        warmup_iters: int = 5,
+        test_iters: int = 20,
+    ) -> Tuple[torch.Tensor, float]:
         """Benchmark all-reduce in eager mode
-        
+
         Returns:
             Tuple of (output_tensor, time_per_iter_us)
         """
         func = self.get_implementation_function(impl_name)
-        
+
         # Warmup
         for _ in range(warmup_iters):
             _ = func(tensor.clone())
             torch.cuda.synchronize()
-        
+
         # Get output for correctness checking
         output_tensor = func(tensor.clone())
         torch.cuda.synchronize()
-        
+
         # Benchmark
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-        
+
         torch.cuda.synchronize()
         dist.barrier()
-        
+
         start_event.record()
         for _ in range(test_iters):
             _ = func(tensor.clone())
         end_event.record()
-        
+
         end_event.synchronize()
-        
+
         # Convert to microseconds per iteration
         time_per_iter_us = start_event.elapsed_time(end_event) * 1000 / test_iters
         return output_tensor, time_per_iter_us
-    
-    def benchmark_graph_mode(self, impl_name: str, tensor: torch.Tensor,
-                           warmup_iters: int = 5, test_iters: int = 20) -> Tuple[torch.Tensor, float]:
+
+    def benchmark_graph_mode(
+        self,
+        impl_name: str,
+        tensor: torch.Tensor,
+        warmup_iters: int = 5,
+        test_iters: int = 20,
+    ) -> Tuple[torch.Tensor, float]:
         """Benchmark all-reduce in graph mode
-        
+
         Returns:
             Tuple of (output_tensor, time_per_iter_us)
         """
         # torch.distributed.all_reduce cannot work in CUDA graphs
         if impl_name == "torch_native":
-            return self.benchmark_eager_mode(impl_name, tensor, warmup_iters, test_iters)
-        
+            return self.benchmark_eager_mode(
+                impl_name, tensor, warmup_iters, test_iters
+            )
+
         func = self.get_implementation_function(impl_name)
         is_inplace = impl_name == "inplace_all_reduce"
         if is_inplace:
             base_tensor = tensor.clone()
-        
+
         # Graph capture
         try:
             with graph_capture() as graph_capture_context:
@@ -341,30 +396,34 @@ class AllReduceBenchmark:
                         tensor.copy_(base_tensor)
                     graph_out = func(tensor)
         except (AssertionError, RuntimeError) as e:
-            if "tensor model parallel group is not initialized" in str(e) or "CUDA" in str(e):
-                return self.benchmark_eager_mode(impl_name, tensor, warmup_iters, test_iters)
+            if "tensor model parallel group is not initialized" in str(
+                e
+            ) or "CUDA" in str(e):
+                return self.benchmark_eager_mode(
+                    impl_name, tensor, warmup_iters, test_iters
+                )
             # Fallback to simple graph capture
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 if is_inplace:
                     tensor.copy_(base_tensor)
                 graph_out = func(tensor)
-        
+
         # Warmup
         for _ in range(warmup_iters):
             graph.replay()
         torch.cuda.synchronize()
-        
+
         # Get output for correctness checking
         graph.replay()
         torch.cuda.synchronize()
         func_output = graph_out.clone()
         torch.cuda.synchronize()
-        
+
         # Benchmark
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-        
+
         latencies: List[float] = []
         for _ in range(test_iters):
             torch.cuda.synchronize()
@@ -374,7 +433,7 @@ class AllReduceBenchmark:
             end_event.record()
             end_event.synchronize()
             latencies.append(start_event.elapsed_time(end_event))
-        
+
         # Convert to microseconds per iteration
         time_per_iter_us = sum(latencies) / len(latencies) * 1000
         graph.reset()
@@ -404,34 +463,45 @@ def human_readable_size(size_bytes: int, decimal_places: int = 1) -> str:
     return f"{size_bytes:.{decimal_places}f} {unit}"
 
 
-def print_mode_results_table(results: List[Dict[str, Any]], mode: str, implementations: List[str]):
+def print_mode_results_table(
+    results: List[Dict[str, Any]], mode: str, implementations: List[str]
+):
     """Print benchmark results for a specific mode in a formatted table"""
     if not results:
         return
-    
+
     # Filter implementations that have results for this mode
     mode_suffix = f"_{mode}"
-    available_impls = [impl for impl in implementations 
-                      if any(f"{impl}{mode_suffix}" in result for result in results)]
-    
+    available_impls = [
+        impl
+        for impl in implementations
+        if any(f"{impl}{mode_suffix}" in result for result in results)
+    ]
+
     if not available_impls:
         return
-    
+
     # Print header
     mode_title = mode.upper()
     print(f"\n{'='*80}")
     print(f"ALL-REDUCE BENCHMARK RESULTS - {mode_title} MODE")
     print(f"Time in microseconds (µs), lower is better")
     print(f"{'='*80}")
-    
+
     # Create table header
     col_width = max(12, max(len(impl) for impl in available_impls))
-    header = "| Size      | " + " | ".join([f"{impl:>{col_width}}" for impl in available_impls]) + " |"
-    separator = "|-----------|-" + "-|-".join(["-" * col_width for _ in available_impls]) + "-|"
-    
+    header = (
+        "| Size      | "
+        + " | ".join([f"{impl:>{col_width}}" for impl in available_impls])
+        + " |"
+    )
+    separator = (
+        "|-----------|-" + "-|-".join(["-" * col_width for _ in available_impls]) + "-|"
+    )
+
     print(header)
     print(separator)
-    
+
     # Print rows
     for result in results:
         row = f"| {result['size_human']:>9} | "
@@ -443,41 +513,101 @@ def print_mode_results_table(results: List[Dict[str, Any]], mode: str, implement
             else:
                 row += f"{str(time_val):>{col_width}} | "
         print(row)
-    
-    print("="*80)
+
+    print("=" * 80)
 
 
-def print_mode_fastest(results: List[Dict[str, Any]], mode: str, implementations: List[str]):
+def print_mode_fastest(
+    results: List[Dict[str, Any]], mode: str, implementations: List[str]
+):
     """Find and print the fastest implementation for each size in a specific mode"""
     if not results:
         return
-    
+
     mode_suffix = f"_{mode}"
     mode_title = mode.upper()
-    
-    print(f"\nFASTEST IMPLEMENTATIONS PER SIZE - {mode_title} MODE:")
-    print("="*60)
 
+    print(f"\nFASTEST IMPLEMENTATIONS PER SIZE - {mode_title} MODE:")
+    print("=" * 60)
     name_width = max(20, max(len(impl) for impl in implementations))
-    
+
     for result in results:
         size = result["size_human"]
-        
+
         # Find implementation with minimum time for this mode
         impl_times = {}
         for impl in implementations:
             key = f"{impl}{mode_suffix}"
             if key in result and isinstance(result[key], (int, float)):
                 impl_times[impl] = result[key]
-        
+
         if impl_times:
             fastest_impl = min(impl_times, key=impl_times.get)
             fastest_time = impl_times[fastest_impl]
             print(f"{size:>9}: {fastest_impl:>{name_width}} ({fastest_time:>8.1f} µs)")
         else:
             print(f"{size:>9}: {'No successful runs':>{name_width}}")
-    
-    print("="*60)
+
+    print("=" * 60)
+
+
+def build_tuning_thresholds(
+    results: List[Dict[str, Any]],
+    mode: str,
+    implementations: List[str],
+    benchmark: AllReduceBenchmark,
+    device: torch.device,
+    dtype: torch.dtype,
+    respect_impl_constraints: bool,
+) -> List[Dict[str, Any]]:
+    """Build size thresholds selecting fastest impl per size."""
+    thresholds: List[Dict[str, Any]] = []
+    last_impl: Optional[str] = None
+    for result in results:
+        size_bytes = result["size_bytes"]
+        tensor_elems = size_bytes // torch.tensor(0, dtype=dtype).element_size()
+        test_tensor = torch.empty((int(tensor_elems),), device=device, dtype=dtype)
+        best_impl = None
+        best_time = None
+        for impl in implementations:
+            key = f"{impl}_{mode}"
+            time_val = result.get(key, None)
+            if not isinstance(time_val, (int, float)):
+                continue
+            if respect_impl_constraints and not benchmark.impl_supports_tensor(
+                impl, test_tensor
+            ):
+                continue
+            if best_time is None or time_val < best_time:
+                best_time = time_val
+                best_impl = impl
+        if best_impl is None:
+            continue
+        if best_impl != last_impl:
+            thresholds.append({"max_size_bytes": size_bytes, "impl": best_impl})
+            last_impl = best_impl
+        else:
+            thresholds[-1]["max_size_bytes"] = size_bytes
+    return thresholds
+
+
+def resolve_export_path(base_path: str, suffix: str) -> str:
+    if os.path.isdir(base_path):
+        return os.path.join(base_path, suffix)
+    return base_path
+
+
+def export_tuning_json(
+    export_path: str,
+    thresholds_by_mode: Dict[str, List[Dict[str, Any]]],
+    meta: Dict[str, Any],
+):
+    export_dir = os.path.dirname(export_path)
+    if export_dir:
+        os.makedirs(export_dir, exist_ok=True)
+    payload = {"meta": meta, "thresholds": thresholds_by_mode}
+    with open(export_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
 
 
 def _get_tolerances(impl: str, world_size: int) -> Tuple[float, float]:
@@ -536,55 +666,49 @@ def parse_args():
         "--min-size",
         type=int,
         default=10,
-        help="Minimum size as power of 2 (e.g., 10 for 2^10 = 1KB)"
+        help="Minimum size as power of 2 (e.g., 10 for 2^10 = 1KB)",
     )
     parser.add_argument(
-        "--max-size", 
-        type=int, 
-        default=27,
-        help="Maximum size as power of 2 (e.g., 27 for 2^27 = 128MB)"
-    )
-    parser.add_argument(
-        "--step",
+        "--max-size",
         type=int,
-        default=1,
-        help="Step size between power of 2 sizes"
+        default=27,
+        help="Maximum size as power of 2 (e.g., 27 for 2^27 = 128MB)",
+    )
+    parser.add_argument(
+        "--step", type=int, default=1, help="Step size between power of 2 sizes"
     )
     parser.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
         choices=["float32", "float16", "bfloat16"],
-        help="Data type for benchmark tensors"
+        help="Data type for benchmark tensors",
     )
     parser.add_argument(
         "--mode",
         type=str,
         default="both",
         choices=["eager", "graph", "both"],
-        help="Benchmark mode: eager, graph, or both"
+        help="Benchmark mode: eager, graph, or both",
+    )
+    parser.add_argument("--profile", action="store_true", help="Enable torch profiling")
+    parser.add_argument(
+        "--warmup-iters", type=int, default=10, help="Number of warmup iterations"
     )
     parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Enable torch profiling"
-    )
-    parser.add_argument(
-        "--warmup-iters",
-        type=int,
-        default=10,
-        help="Number of warmup iterations"
-    )
-    parser.add_argument(
-        "--test-iters",
-        type=int,
-        default=20,
-        help="Number of test iterations"
+        "--test-iters", type=int, default=20, help="Number of test iterations"
     )
     parser.add_argument(
         "--check-correctness",
         action="store_true",
-        help="Enable correctness checking (compares all implementations against torch_native)"
+        dest="check_correctness",
+        help="Enable correctness checking (compares all implementations against torch_native)",
+    )
+    parser.add_argument(
+        "--correctness-test",
+        action="store_true",
+        dest="check_correctness",
+        help="Alias for --check-correctness",
     )
     parser.add_argument(
         "--impls",
@@ -599,35 +723,52 @@ def parse_args():
             "Example: torch_native,pynccl,custom_ar_sgl,custom_ar_aiter,quick_ar_fp,inplace_all_reduce"
         ),
     )
-    
+    parser.add_argument(
+        "--export-tuning",
+        type=str,
+        default=None,
+        help=(
+            "Export tuning thresholds as JSON. If a directory is provided, a "
+            "filename will be generated automatically."
+        ),
+    )
+    parser.add_argument(
+        "--respect-impl-constraints",
+        action="store_true",
+        help=(
+            "When exporting tuning data, respect runtime size constraints "
+            "(e.g., _QR_MIN_SIZE and should_custom_ar checks)."
+        ),
+    )
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    
+
     # Initialize distributed
     if not dist.is_initialized():
         dist.init_process_group(backend="gloo")
-    
+
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    
+
     # Set device
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     torch.cuda.set_device(device)
-    
+
     # Create benchmark instance
     benchmark = AllReduceBenchmark(world_size, rank, device)
-    
+
     # Get dtype
     dtype_map = {
         "float32": torch.float32,
-        "float16": torch.float16, 
-        "bfloat16": torch.bfloat16
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
     }
     dtype = dtype_map[args.dtype]
-    
+
     # Size range
     if IS_CI:
         size_range = range(10, 12)
@@ -636,7 +777,7 @@ def main():
 
     max_size_bytes = 2 ** max(size_range)
     benchmark.initialize_communicators(max_size_bytes=max_size_bytes)
-    
+
     # Available implementations (full default set)
     implementations = [
         "torch_native",
@@ -669,39 +810,49 @@ def main():
 
     # Filter to only available implementations
     implementations = [impl for impl in implementations if impl_available(impl)]
-    
+
     size_list = list(size_range)
     results = [
-        {"size_bytes": 2 ** size_power, "size_human": human_readable_size(2 ** size_power)}
+        {"size_bytes": 2**size_power, "size_human": human_readable_size(2**size_power)}
         for size_power in size_list
     ]
     modes_to_run = ["eager", "graph"] if args.mode == "both" else [args.mode]
     check_ref = args.check_correctness and "torch_native" in implementations
     if args.check_correctness and "torch_native" not in implementations and rank == 0:
-        print("Warning: --check-correctness requires torch_native in --impls; skipping checks.")
+        print(
+            "Warning: --check-correctness requires torch_native in --impls; skipping checks."
+        )
 
     if check_ref and implementations[0] != "torch_native":
-        implementations = ["torch_native"] + [impl for impl in implementations if impl != "torch_native"]
-    
+        implementations = ["torch_native"] + [
+            impl for impl in implementations if impl != "torch_native"
+        ]
+
     # Profiler context
-    prof_ctx = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        with_stack=True,
-    ) if args.profile else nullcontext()
-    
+    prof_ctx = (
+        torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=True,
+        )
+        if args.profile
+        else nullcontext()
+    )
+
     with prof_ctx as prof:
         for mode in modes_to_run:
             for idx, size_power in enumerate(size_list):
-                size_bytes = 2 ** size_power
+                size_bytes = 2**size_power
 
                 # Skip if too large (cap total tensor bytes)
                 if size_bytes > 2**31:
                     if rank == 0:
-                        print(f"Skipping size {human_readable_size(size_bytes)} - too large")
+                        print(
+                            f"Skipping size {human_readable_size(size_bytes)} - too large"
+                        )
                     continue
 
                 # Create test tensor
@@ -713,7 +864,9 @@ def main():
 
                 if rank == 0:
                     print(f"\n{'='*80}")
-                    print(f"Benchmarking size: {human_readable_size(size_bytes)} ({tensor_size} elements)")
+                    print(
+                        f"Benchmarking size: {human_readable_size(size_bytes)} ({tensor_size} elements)"
+                    )
                     print(f"{'='*80}")
 
                 result = results[idx]
@@ -732,7 +885,10 @@ def main():
                             )
                         else:  # graph
                             output, time_us = benchmark.benchmark_graph_mode(
-                                impl, test_tensor.clone(), args.warmup_iters, args.test_iters
+                                impl,
+                                test_tensor.clone(),
+                                args.warmup_iters,
+                                args.test_iters,
                             )
 
                         result[key] = time_us
@@ -745,7 +901,9 @@ def main():
                                 reference_output = output
                             elif reference_output is not None:
                                 if rank == 0 and not printed_correctness_header:
-                                    print(f"\nCorrectness Check - {mode.upper()} mode @ {human_readable_size(size_bytes)}:")
+                                    print(
+                                        f"\nCorrectness Check - {mode.upper()} mode @ {human_readable_size(size_bytes)}:"
+                                    )
                                     print("-" * 60)
                                     printed_correctness_header = True
                                 passed, detail = check_output_correctness(
@@ -766,35 +924,89 @@ def main():
                                 or "failed validation" in error_msg
                             ):
                                 result[key] = "SKIPPED"
-                                print(f"  {impl:>20} ({mode:>5}): SKIPPED - {error_msg}")
+                                print(
+                                    f"  {impl:>20} ({mode:>5}): SKIPPED - {error_msg}"
+                                )
                             else:
                                 result[key] = "FAILED"
                                 print(f"  {impl:>20} ({mode:>5}): FAILED - {e}")
                         else:
                             result[key] = "SKIPPED"
-    
+
     # Print results on rank 0
     if rank == 0:
         # Print separate tables for each mode
         if "eager" in modes_to_run:
             print_mode_results_table(results, "eager", implementations)
             print_mode_fastest(results, "eager", implementations)
-        
+
         if "graph" in modes_to_run:
             print_mode_results_table(results, "graph", implementations)
             print_mode_fastest(results, "graph", implementations)
-    
+
+        # Export tuning data if requested
+        if args.export_tuning:
+            device_name = (
+                torch.cuda.get_device_name(device)
+                if device.type == "cuda"
+                else str(device)
+            )
+            if not device_name:
+                try:
+                    device_name = torch.cuda.get_device_properties(device).gcnArchName
+                except Exception:
+                    device_name = "unknown_device"
+            safe_device_name = (
+                device_name.replace(" ", "_")
+                .replace("/", "_")
+                .replace(":", "_")
+                .replace("+", "_")
+                .replace("-", "_")
+            )
+            modes_label = "both" if args.mode == "both" else args.mode
+            suffix = (
+                f"amd_ar_tuning_{safe_device_name}_ws{world_size}_"
+                f"{args.dtype}_{modes_label}.json"
+            )
+            export_path = resolve_export_path(args.export_tuning, suffix)
+            thresholds_by_mode = {
+                mode: build_tuning_thresholds(
+                    results=results,
+                    mode=mode,
+                    implementations=implementations,
+                    benchmark=benchmark,
+                    device=device,
+                    dtype=dtype,
+                    respect_impl_constraints=args.respect_impl_constraints,
+                )
+                for mode in modes_to_run
+            }
+            meta = {
+                "device_name": device_name,
+                "world_size": world_size,
+                "dtype": args.dtype,
+                "modes": modes_to_run,
+                "impls": implementations,
+                "size_powers": size_list,
+                "min_size_power": args.min_size,
+                "max_size_power": args.max_size,
+                "step": args.step,
+                "respect_impl_constraints": args.respect_impl_constraints,
+                "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            }
+            export_tuning_json(export_path, thresholds_by_mode, meta)
+            print(f"\nTuning data exported to {export_path}")
+
     # Export profile if enabled
     if args.profile and rank == 0 and prof is not None:
         prof_dir = "prof/comprehensive_allreduce"
         os.makedirs(prof_dir, exist_ok=True)
         prof.export_chrome_trace(f"{prof_dir}/trace_rank{rank}.json.gz")
         print(f"\nProfiler trace saved to {prof_dir}/trace_rank{rank}.json.gz")
-    
+
     benchmark.close()
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
-

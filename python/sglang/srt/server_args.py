@@ -587,6 +587,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
+    enable_amd_ar_tuning: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -2020,6 +2021,12 @@ class ServerArgs:
     def _handle_amd_specifics(self):
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+        elif self.enable_amd_ar_tuning:
+            logger.warning(
+                "--enable-amd-ar-tuning is only supported on HIP devices; "
+                "disabling it."
+            )
+            self.enable_amd_ar_tuning = False
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
@@ -4429,6 +4436,14 @@ class ServerArgs:
             "--enable-torch-symm-mem",
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+        )
+        parser.add_argument(
+            "--enable-amd-ar-tuning",
+            action="store_true",
+            help=(
+                "Enable AMD all-reduce tuning (HIP only). "
+                "Uses a tuned threshold table to select all-reduce implementations."
+            ),
         )
         parser.add_argument(
             "--disable-overlap-schedule",

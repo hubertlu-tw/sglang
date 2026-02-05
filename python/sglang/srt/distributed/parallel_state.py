@@ -23,6 +23,8 @@ If you only need to use the distributed environment without model/pipeline
 """
 import contextlib
 import gc
+import glob
+import json
 import logging
 import os
 import pickle
@@ -44,6 +46,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
+    get_device_name,
     get_int_env_var,
     get_local_ip_auto,
     is_cpu,
@@ -302,6 +305,13 @@ class GroupCoordinator:
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
+        self.enable_amd_ar_tuning = _ENABLE_AMD_AR_TUNING and is_hip()
+        self._amd_ar_tuning_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._amd_ar_tuning_warned: set[str] = set()
+        self._amd_ar_tuning_debugged: set[str] = set()
+        self.ca_comm_sgl: Optional[Any] = None
+        self.ca_comm_aiter: Optional[Any] = None
+        self.qr_comms: Dict[str, Any] = {}
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -372,6 +382,61 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+
+            if self.enable_amd_ar_tuning and is_hip():
+                try:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                        CustomAllreduce as SGLCustomAllreduce,
+                    )
+                except Exception:
+                    SGLCustomAllreduce = None
+                try:
+                    from aiter.dist.device_communicators.custom_all_reduce import (
+                        CustomAllreduce as AiterCustomAllreduce,
+                    )
+                except Exception:
+                    AiterCustomAllreduce = None
+
+                if SGLCustomAllreduce is not None:
+                    try:
+                        self.ca_comm_sgl = SGLCustomAllreduce(
+                            group=self.cpu_group, device=self.device
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to initialize SGL custom allreduce: {e}"
+                        )
+                if AiterCustomAllreduce is not None:
+                    try:
+                        self.ca_comm_aiter = AiterCustomAllreduce(
+                            group=self.cpu_group, device=self.device
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to initialize Aiter custom allreduce: {e}"
+                        )
+
+                if qr_rocm_arch_available():
+                    quick_modes = ["FP", "INT8", "INT6", "INT4"]
+                    original_qr_mode = os.environ.get(
+                        "ROCM_QUICK_REDUCE_QUANTIZATION", None
+                    )
+                    for mode in quick_modes:
+                        try:
+                            os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = mode
+                            comm = QuickAllReduce(
+                                group=self.cpu_group, device=self.device
+                            )
+                            if comm is not None and not comm.disabled:
+                                self.qr_comms[mode.lower()] = comm
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to initialize QuickAllReduce {mode}: {e}"
+                            )
+                    if original_qr_mode is None:
+                        os.environ.pop("ROCM_QUICK_REDUCE_QUANTIZATION", None)
+                    else:
+                        os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = original_qr_mode
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
@@ -471,8 +536,18 @@ class GroupCoordinator:
             stream = graph_capture_context.stream
         # We don't need the context of custom quick allreduce because the ipc access
         # is already collected in init() and we can capture the quick allreduce directly.
-        ca_comm = self.ca_comm
-        maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+        ca_comms = [
+            comm
+            for comm in [self.ca_comm, self.ca_comm_sgl, self.ca_comm_aiter]
+            if comm is not None
+        ]
+        if not ca_comms:
+            maybe_ca_context = nullcontext()
+        else:
+            stack = contextlib.ExitStack()
+            for comm in ca_comms:
+                stack.enter_context(comm.capture())
+            maybe_ca_context = stack
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -521,6 +596,148 @@ class GroupCoordinator:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
+
+    def _amd_ar_dtype_str(self, dtype: torch.dtype) -> str:
+        if dtype == torch.float16:
+            return "float16"
+        if dtype == torch.bfloat16:
+            return "bfloat16"
+        if dtype == torch.float32:
+            return "float32"
+        return str(dtype)
+
+    def _is_graph_mode(self) -> bool:
+        try:
+            return self.device_module.is_current_stream_capturing()
+        except Exception:
+            return False
+
+    def _load_amd_ar_tuning(
+        self, dtype_str: str, mode: str
+    ) -> Optional[Dict[str, Any]]:
+        cache_key = f"{dtype_str}:{mode}"
+        if cache_key in self._amd_ar_tuning_cache:
+            return self._amd_ar_tuning_cache[cache_key]
+        base_dir = os.path.join(os.path.dirname(__file__), "tuning", "amd_ar")
+        device_name = get_device_name(self.device)
+        if not device_name:
+            try:
+                device_name = torch.cuda.get_device_properties(self.device).gcnArchName
+            except Exception:
+                device_name = "unknown_device"
+        device_name = (
+            device_name.strip() if isinstance(device_name, str) else device_name
+        )
+        safe_device_name = (
+            device_name.replace(" ", "_")
+            .replace("/", "_")
+            .replace(":", "_")
+            .replace("+", "_")
+            .replace("-", "_")
+        )
+        candidates = [
+            f"amd_ar_tuning_{safe_device_name}_ws{self.world_size}_{dtype_str}_both.json",
+            f"amd_ar_tuning_{safe_device_name}_ws{self.world_size}_{dtype_str}_{mode}.json",
+        ]
+        for name in candidates:
+            path = os.path.join(base_dir, name)
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    self._amd_ar_tuning_cache[cache_key] = data
+                    return data
+                except Exception as e:
+                    logger.warning(f"Failed to load AMD AR tuning file {path}: {e}")
+        glob_patterns = [
+            os.path.join(
+                base_dir,
+                f"amd_ar_tuning_*_ws{self.world_size}_{dtype_str}_{mode}.json",
+            ),
+            os.path.join(
+                base_dir,
+                f"amd_ar_tuning_*_ws{self.world_size}_{dtype_str}_both.json",
+            ),
+        ]
+        for pattern in glob_patterns:
+            matches = sorted(glob.glob(pattern))
+            if not matches:
+                continue
+            path = matches[0]
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._amd_ar_tuning_cache[cache_key] = data
+                return data
+            except Exception as e:
+                logger.warning(f"Failed to load AMD AR tuning file {path}: {e}")
+        warn_key = f"{dtype_str}:{mode}"
+        if warn_key not in self._amd_ar_tuning_warned:
+            logger.warning(
+                "AMD AR tuning enabled but no tuning file found for "
+                f"dtype={dtype_str}, world_size={self.world_size}, device={device_name}."
+            )
+            self._amd_ar_tuning_warned.add(warn_key)
+        self._amd_ar_tuning_cache[cache_key] = None
+        return None
+
+    def _select_amd_ar_impl(self, input_: torch.Tensor) -> Optional[str]:
+        dtype_str = self._amd_ar_dtype_str(input_.dtype)
+        mode = "graph" if self._is_graph_mode() else "eager"
+        tuning = self._load_amd_ar_tuning(dtype_str, mode)
+        if not tuning:
+            return None
+        thresholds = tuning.get("thresholds", {}).get(mode, [])
+        if not thresholds:
+            return None
+        size_bytes = input_.numel() * input_.element_size()
+        for entry in thresholds:
+            if size_bytes <= entry.get("max_size_bytes", -1):
+                return entry.get("impl")
+        return thresholds[-1].get("impl")
+
+    def _try_amd_ar_impl(
+        self, impl: str, input_: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if impl == "torch_native":
+            torch.distributed.all_reduce(input_, group=self.device_group)
+            return input_
+        if impl == "pynccl":
+            if self.pynccl_comm is None or not self.is_symmetric_memory_enabled():
+                return None
+            with self.pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
+                self.pynccl_comm.all_reduce(input_)
+            return input_
+        if impl == "inplace_all_reduce":
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
+        if impl == "custom_ar_sgl":
+            comm = self.ca_comm_sgl
+            if comm is None or getattr(comm, "disabled", False):
+                return None
+            if hasattr(comm, "should_custom_ar") and not comm.should_custom_ar(input_):
+                return None
+            return comm.custom_all_reduce(input_)
+        if impl == "custom_ar_aiter":
+            comm = self.ca_comm_aiter
+            if comm is None or getattr(comm, "disabled", False):
+                return None
+            if hasattr(comm, "should_custom_ar") and not comm.should_custom_ar(input_):
+                return None
+            return comm.custom_all_reduce(input_)
+        if impl.startswith("quick_ar_"):
+            mode = impl.split("_", 2)[2].lower()
+            comm = self.qr_comms.get(mode)
+            if comm is None or getattr(comm, "disabled", False):
+                return None
+            if hasattr(
+                comm, "should_quick_allreduce"
+            ) and not comm.should_quick_allreduce(input_):
+                return None
+            return comm.quick_all_reduce(input_)
+        return None
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
@@ -576,6 +793,36 @@ class GroupCoordinator:
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
+
+        if self.enable_amd_ar_tuning and is_hip() and not input_.is_cpu:
+            tuned_impl = self._select_amd_ar_impl(input_)
+            if tuned_impl:
+                try:
+                    tuned_out = self._try_amd_ar_impl(tuned_impl, input_)
+                    if tuned_out is not None:
+                        if os.environ.get("SGLANG_AMD_AR_TUNING_DEBUG") == "1":
+                            mode = "graph" if self._is_graph_mode() else "eager"
+                            size_bytes = input_.numel() * input_.element_size()
+                            debug_key = f"{mode}:{tuned_impl}"
+                            if debug_key not in self._amd_ar_tuning_debugged:
+                                logger.info(
+                                    "AMD AR tuning selected impl=%s mode=%s "
+                                    "dtype=%s size_bytes=%d",
+                                    tuned_impl,
+                                    mode,
+                                    self._amd_ar_dtype_str(input_.dtype),
+                                    size_bytes,
+                                )
+                                self._amd_ar_tuning_debugged.add(debug_key)
+                        return tuned_out
+                except Exception as e:
+                    warn_key = f"impl:{tuned_impl}"
+                    if warn_key not in self._amd_ar_tuning_warned:
+                        logger.warning(
+                            f"AMD AR tuning failed for impl={tuned_impl}: {e}. "
+                            "Falling back to default selection."
+                        )
+                        self._amd_ar_tuning_warned.add(warn_key)
 
         if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
             with self.pynccl_comm.change_state(
@@ -1313,6 +1560,19 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.ca_comm_sgl is not None:
+            if hasattr(self.ca_comm_sgl, "close"):
+                self.ca_comm_sgl.close()
+            self.ca_comm_sgl = None
+        if self.ca_comm_aiter is not None:
+            if hasattr(self.ca_comm_aiter, "close"):
+                self.ca_comm_aiter.close()
+            self.ca_comm_aiter = None
+        if self.qr_comms:
+            for comm in self.qr_comms.values():
+                if comm is not None and hasattr(comm, "close"):
+                    comm.close()
+            self.qr_comms = {}
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1455,6 +1715,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_AMD_AR_TUNING = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1470,6 +1731,11 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_amd_ar_tuning(enable: bool):
+    global _ENABLE_AMD_AR_TUNING
+    _ENABLE_AMD_AR_TUNING = enable
 
 
 def init_distributed_environment(
