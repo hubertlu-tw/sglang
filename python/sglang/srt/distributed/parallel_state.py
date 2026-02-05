@@ -312,9 +312,8 @@ class GroupCoordinator:
         self._amd_ar_tuning_stats_enabled = (
             os.environ.get("SGLANG_AMD_AR_TUNING_STATS") == "1"
         )
-        self._amd_ar_tuning_stats_every = int(
-            os.environ.get("SGLANG_AMD_AR_TUNING_STATS_EVERY", "1000")
-        )
+        # Log stats at a fixed interval; no env override needed.
+        self._amd_ar_tuning_stats_every = 200
         self._amd_ar_tuning_stats_calls = 0
         self._amd_ar_tuning_stats: Dict[str, Dict[int, Dict[str, int]]] = {}
         self.ca_comm_sgl: Optional[Any] = None
@@ -716,6 +715,8 @@ class GroupCoordinator:
     ) -> None:
         if not self._amd_ar_tuning_stats_enabled:
             return
+        if self.local_rank != 0:
+            return
         stats = self._amd_ar_tuning_stats.setdefault(mode, {})
         bucket = stats.setdefault(bucket_max_size, {})
         bucket[impl] = bucket.get(impl, 0) + 1
@@ -840,18 +841,19 @@ class GroupCoordinator:
                     tuned_out = self._try_amd_ar_impl(tuned_impl, input_)
                     if tuned_out is not None:
                         if os.environ.get("SGLANG_AMD_AR_TUNING_DEBUG") == "1":
-                            debug_key = f"{mode}:{tuned_impl}"
-                            if debug_key not in self._amd_ar_tuning_debugged:
-                                logger.info(
-                                    "AMD AR tuning selected impl=%s mode=%s "
-                                    "dtype=%s size_bytes=%d bucket_max=%s",
-                                    tuned_impl,
-                                    mode,
-                                    self._amd_ar_dtype_str(input_.dtype),
-                                    size_bytes,
-                                    bucket_max,
-                                )
-                                self._amd_ar_tuning_debugged.add(debug_key)
+                            if self.local_rank == 0:
+                                debug_key = f"{mode}:{tuned_impl}"
+                                if debug_key not in self._amd_ar_tuning_debugged:
+                                    logger.info(
+                                        "AMD AR tuning selected impl=%s mode=%s "
+                                        "dtype=%s size_bytes=%d bucket_max=%s",
+                                        tuned_impl,
+                                        mode,
+                                        self._amd_ar_dtype_str(input_.dtype),
+                                        size_bytes,
+                                        bucket_max,
+                                    )
+                                    self._amd_ar_tuning_debugged.add(debug_key)
                         if bucket_max is not None:
                             self._record_amd_ar_tuning_stats(
                                 mode, int(bucket_max), tuned_impl

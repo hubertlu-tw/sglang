@@ -71,7 +71,9 @@ class AllReduceBenchmark:
         self.invalid_impls = set()
         self.initialized = False
 
-    def initialize_communicators(self, max_size_bytes: int):
+    def initialize_communicators(
+        self, max_size_bytes: int, enable_torch_symm_mem: bool = False
+    ):
         """Initialize all available communicators"""
         if self.initialized:
             return
@@ -97,11 +99,14 @@ class AllReduceBenchmark:
         # Base communicators from group
         self.communicators["torch_native"] = group.device_group
         self.communicators["pynccl"] = group.pynccl_comm
-        torch_symm_mem_comm = TorchSymmMemCommunicator(
-            group=group.cpu_group, device=self.device
-        )
-        if torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
-            self.communicators["torch_symm_mem"] = torch_symm_mem_comm
+        if enable_torch_symm_mem:
+            torch_symm_mem_comm = TorchSymmMemCommunicator(
+                group=group.cpu_group, device=self.device
+            )
+            if torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
+                self.communicators["torch_symm_mem"] = torch_symm_mem_comm
+            else:
+                self.communicators["torch_symm_mem"] = None
         else:
             self.communicators["torch_symm_mem"] = None
 
@@ -924,13 +929,8 @@ def main():
     }
     dtype = dtype_map[args.dtype]
 
-    # Size list
-    size_bytes_list, size_powers = resolve_size_bytes(args)
-    max_size_bytes = max(size_bytes_list)
-    benchmark.initialize_communicators(max_size_bytes=max_size_bytes)
-
-    # Available implementations (full default set)
-    implementations = [
+    # Available implementations (valid set)
+    valid_impls = [
         "torch_native",
         "pynccl",
         "custom_ar_sgl",
@@ -944,14 +944,32 @@ def main():
     ]
 
     requested_impls = [s.strip() for s in args.impls.split(",") if s.strip()]
-    unknown_impls = [impl for impl in requested_impls if impl not in implementations]
+    unknown_impls = [impl for impl in requested_impls if impl not in valid_impls]
     if unknown_impls:
         raise ValueError(
             f"Unknown implementations in --impls: {unknown_impls}. "
-            f"Valid options: {implementations}"
+            f"Valid options: {valid_impls}"
         )
-    if requested_impls:
-        implementations = requested_impls
+    default_impls = [
+        "torch_native",
+        "pynccl",
+        "custom_ar_sgl",
+        "custom_ar_aiter",
+        "quick_ar_fp",
+        "quick_ar_int8",
+        "quick_ar_int6",
+        "quick_ar_int4",
+        "inplace_all_reduce",
+    ]
+    implementations = requested_impls if requested_impls else default_impls
+
+    # Size list
+    size_bytes_list, size_powers = resolve_size_bytes(args)
+    max_size_bytes = max(size_bytes_list)
+    benchmark.initialize_communicators(
+        max_size_bytes=max_size_bytes,
+        enable_torch_symm_mem="torch_symm_mem" in implementations,
+    )
 
     def impl_available(impl: str) -> bool:
         if impl.startswith("quick_ar_"):
@@ -1001,7 +1019,7 @@ def main():
             for idx, size_bytes in enumerate(size_bytes_list):
 
                 # Skip if too large (cap total tensor bytes)
-                if size_bytes > 2**31:
+                if size_bytes > 2**32:
                     if rank == 0:
                         print(
                             f"Skipping size {human_readable_size(size_bytes)} - too large"
