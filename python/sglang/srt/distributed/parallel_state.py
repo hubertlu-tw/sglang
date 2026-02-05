@@ -309,6 +309,14 @@ class GroupCoordinator:
         self._amd_ar_tuning_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self._amd_ar_tuning_warned: set[str] = set()
         self._amd_ar_tuning_debugged: set[str] = set()
+        self._amd_ar_tuning_stats_enabled = (
+            os.environ.get("SGLANG_AMD_AR_TUNING_STATS") == "1"
+        )
+        self._amd_ar_tuning_stats_every = int(
+            os.environ.get("SGLANG_AMD_AR_TUNING_STATS_EVERY", "1000")
+        )
+        self._amd_ar_tuning_stats_calls = 0
+        self._amd_ar_tuning_stats: Dict[str, Dict[int, Dict[str, int]]] = {}
         self.ca_comm_sgl: Optional[Any] = None
         self.ca_comm_aiter: Optional[Any] = None
         self.qr_comms: Dict[str, Any] = {}
@@ -681,20 +689,51 @@ class GroupCoordinator:
         self._amd_ar_tuning_cache[cache_key] = None
         return None
 
-    def _select_amd_ar_impl(self, input_: torch.Tensor) -> Optional[str]:
+    def _select_amd_ar_impl(
+        self, input_: torch.Tensor
+    ) -> Tuple[Optional[str], Optional[int], str, int]:
         dtype_str = self._amd_ar_dtype_str(input_.dtype)
         mode = "graph" if self._is_graph_mode() else "eager"
         tuning = self._load_amd_ar_tuning(dtype_str, mode)
         if not tuning:
-            return None
+            return None, None, mode, 0
         thresholds = tuning.get("thresholds", {}).get(mode, [])
         if not thresholds:
-            return None
+            return None, None, mode, 0
         size_bytes = input_.numel() * input_.element_size()
         for entry in thresholds:
             if size_bytes <= entry.get("max_size_bytes", -1):
-                return entry.get("impl")
-        return thresholds[-1].get("impl")
+                return entry.get("impl"), entry.get("max_size_bytes"), mode, size_bytes
+        return (
+            thresholds[-1].get("impl"),
+            thresholds[-1].get("max_size_bytes"),
+            mode,
+            size_bytes,
+        )
+
+    def _record_amd_ar_tuning_stats(
+        self, mode: str, bucket_max_size: int, impl: str
+    ) -> None:
+        if not self._amd_ar_tuning_stats_enabled:
+            return
+        stats = self._amd_ar_tuning_stats.setdefault(mode, {})
+        bucket = stats.setdefault(bucket_max_size, {})
+        bucket[impl] = bucket.get(impl, 0) + 1
+        self._amd_ar_tuning_stats_calls += 1
+        if (
+            self._amd_ar_tuning_stats_every > 0
+            and self._amd_ar_tuning_stats_calls % self._amd_ar_tuning_stats_every == 0
+        ):
+            impl_totals: Dict[str, int] = {}
+            for buckets in stats.values():
+                for name, count in buckets.items():
+                    impl_totals[name] = impl_totals.get(name, 0) + count
+            logger.info(
+                "AMD AR tuning stats mode=%s buckets=%d impl_totals=%s",
+                mode,
+                len(stats),
+                impl_totals,
+            )
 
     def _try_amd_ar_impl(
         self, impl: str, input_: torch.Tensor
@@ -795,25 +834,28 @@ class GroupCoordinator:
             return self.npu_communicator.all_reduce(input_)
 
         if self.enable_amd_ar_tuning and is_hip() and not input_.is_cpu:
-            tuned_impl = self._select_amd_ar_impl(input_)
+            tuned_impl, bucket_max, mode, size_bytes = self._select_amd_ar_impl(input_)
             if tuned_impl:
                 try:
                     tuned_out = self._try_amd_ar_impl(tuned_impl, input_)
                     if tuned_out is not None:
                         if os.environ.get("SGLANG_AMD_AR_TUNING_DEBUG") == "1":
-                            mode = "graph" if self._is_graph_mode() else "eager"
-                            size_bytes = input_.numel() * input_.element_size()
                             debug_key = f"{mode}:{tuned_impl}"
                             if debug_key not in self._amd_ar_tuning_debugged:
                                 logger.info(
                                     "AMD AR tuning selected impl=%s mode=%s "
-                                    "dtype=%s size_bytes=%d",
+                                    "dtype=%s size_bytes=%d bucket_max=%s",
                                     tuned_impl,
                                     mode,
                                     self._amd_ar_dtype_str(input_.dtype),
                                     size_bytes,
+                                    bucket_max,
                                 )
                                 self._amd_ar_tuning_debugged.add(debug_key)
+                        if bucket_max is not None:
+                            self._record_amd_ar_tuning_stats(
+                                mode, int(bucket_max), tuned_impl
+                            )
                         return tuned_out
                 except Exception as e:
                     warn_key = f"impl:{tuned_impl}"

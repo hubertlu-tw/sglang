@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """AMD All-Reduce Benchmark with Correctness Checking.
 
 Benchmarks AMD-relevant all-reduce implementations across different data sizes
@@ -22,6 +21,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -296,32 +296,45 @@ class AllReduceBenchmark:
         else:
             raise ValueError(f"Unknown implementation: {impl_name}")
 
-    def impl_supports_tensor(self, impl_name: str, tensor: torch.Tensor) -> bool:
-        """Check if an implementation should be used for a tensor size."""
+    def impl_supports_tensor_with_reason(
+        self, impl_name: str, tensor: torch.Tensor
+    ) -> Tuple[bool, str]:
+        """Check if an implementation should be used for a tensor size, with reason."""
         if impl_name.startswith("quick_ar_"):
             mode = impl_name.split("_", 2)[2].lower()
             qcomm = self.quick_ar_comms.get(mode)
-            if qcomm is None or getattr(qcomm, "disabled", False):
-                return False
+            if qcomm is None:
+                return False, "quick_ar_comm_missing"
+            if getattr(qcomm, "disabled", False):
+                return False, "quick_ar_disabled"
             if hasattr(qcomm, "should_quick_allreduce"):
-                return qcomm.should_quick_allreduce(tensor)
-            return True
+                ok = qcomm.should_quick_allreduce(tensor)
+                return ok, "ok" if ok else "quick_ar_guard_failed"
+            return True, "ok"
         if impl_name in ("custom_ar_sgl", "custom_ar_aiter"):
             comm = self.communicators.get(impl_name)
-            if comm is None or getattr(comm, "disabled", False):
-                return False
+            if comm is None:
+                return False, "custom_ar_comm_missing"
+            if getattr(comm, "disabled", False):
+                return False, "custom_ar_disabled"
             if hasattr(comm, "should_custom_ar"):
-                return comm.should_custom_ar(tensor)
-            return True
+                ok = comm.should_custom_ar(tensor)
+                return ok, "ok" if ok else "custom_ar_guard_failed"
+            return True, "ok"
         if impl_name == "pynccl":
             if self.group is None:
-                return False
+                return False, "pynccl_group_missing"
             if hasattr(self.group, "is_symmetric_memory_enabled"):
-                return self.group.is_symmetric_memory_enabled()
-            return True
+                ok = self.group.is_symmetric_memory_enabled()
+                return ok, "ok" if ok else "pynccl_symm_mem_disabled"
+            return True, "ok"
         if impl_name in ("torch_native", "inplace_all_reduce"):
-            return True
-        return True
+            return True, "ok"
+        return True, "ok"
+
+    def impl_supports_tensor(self, impl_name: str, tensor: torch.Tensor) -> bool:
+        ok, _ = self.impl_supports_tensor_with_reason(impl_name, tensor)
+        return ok
 
     def benchmark_eager_mode(
         self,
@@ -591,6 +604,30 @@ def build_tuning_thresholds(
     return thresholds
 
 
+def build_guard_details(
+    results: List[Dict[str, Any]],
+    implementations: List[str],
+    benchmark: AllReduceBenchmark,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[int, Dict[str, str]]:
+    """Record per-size guard failures for implementations."""
+    guard_details: Dict[int, Dict[str, str]] = {}
+    element_size = torch.tensor(0, dtype=dtype).element_size()
+    for result in results:
+        size_bytes = result["size_bytes"]
+        tensor_elems = size_bytes // element_size
+        if tensor_elems <= 0:
+            continue
+        test_tensor = torch.empty((int(tensor_elems),), device=device, dtype=dtype)
+        for impl in implementations:
+            ok, reason = benchmark.impl_supports_tensor_with_reason(impl, test_tensor)
+            if ok:
+                continue
+            guard_details.setdefault(size_bytes, {})[impl] = reason
+    return guard_details
+
+
 def resolve_export_path(base_path: str, suffix: str) -> str:
     if os.path.isdir(base_path):
         return os.path.join(base_path, suffix)
@@ -601,11 +638,14 @@ def export_tuning_json(
     export_path: str,
     thresholds_by_mode: Dict[str, List[Dict[str, Any]]],
     meta: Dict[str, Any],
+    guard_details_by_mode: Optional[Dict[str, Dict[int, Dict[str, str]]]] = None,
 ):
     export_dir = os.path.dirname(export_path)
     if export_dir:
         os.makedirs(export_dir, exist_ok=True)
     payload = {"meta": meta, "thresholds": thresholds_by_mode}
+    if guard_details_by_mode:
+        payload["guards"] = guard_details_by_mode
     with open(export_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
 
@@ -678,6 +718,33 @@ def parse_args():
         "--step", type=int, default=1, help="Step size between power of 2 sizes"
     )
     parser.add_argument(
+        "--size-bytes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of explicit sizes in bytes "
+            "(overrides --min-size/--max-size/--step)."
+        ),
+    )
+    parser.add_argument(
+        "--size-bytes-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a file with explicit sizes in bytes (one per line or comma-separated). "
+            "Overrides --min-size/--max-size/--step."
+        ),
+    )
+    parser.add_argument(
+        "--sizes-from-log",
+        type=str,
+        default=None,
+        help=(
+            "Parse size_bytes values from a log file (e.g., SGLANG_AMD_AR_TUNING_DEBUG logs). "
+            "Overrides --min-size/--max-size/--step."
+        ),
+    )
+    parser.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
@@ -740,8 +807,63 @@ def parse_args():
             "(e.g., _QR_MIN_SIZE and should_custom_ar checks)."
         ),
     )
+    parser.add_argument(
+        "--export-guard-details",
+        action="store_true",
+        help="When exporting tuning data, include per-size guard failure details.",
+    )
+    parser.add_argument(
+        "--export-guard-aware",
+        action="store_true",
+        help=(
+            "Export an additional guard-aware tuning JSON with runtime constraints "
+            "enforced (suffix: _guard_aware.json)."
+        ),
+    )
 
     return parser.parse_args()
+
+
+def _parse_size_bytes_items(raw: str) -> List[int]:
+    if not raw:
+        return []
+    parts = re.split(r"[,\s]+", raw.strip())
+    sizes: List[int] = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            sizes.append(int(part))
+        except ValueError:
+            raise ValueError(f"Invalid size bytes value: {part}")
+    return sizes
+
+
+def resolve_size_bytes(
+    args: argparse.Namespace,
+) -> Tuple[List[int], Optional[List[int]]]:
+    """Return (size_bytes_list, size_powers_list_or_None)."""
+    size_bytes: List[int] = []
+    if args.size_bytes:
+        size_bytes.extend(_parse_size_bytes_items(args.size_bytes))
+    if args.size_bytes_file:
+        with open(args.size_bytes_file, "r", encoding="utf-8") as f:
+            size_bytes.extend(_parse_size_bytes_items(f.read()))
+    if args.sizes_from_log:
+        with open(args.sizes_from_log, "r", encoding="utf-8") as f:
+            content = f.read()
+        matches = re.findall(r"size_bytes=(\d+)", content)
+        size_bytes.extend(int(m) for m in matches)
+    if size_bytes:
+        size_bytes = sorted(set(size_bytes))
+        return size_bytes, None
+
+    if IS_CI:
+        size_powers = list(range(10, 12))
+    else:
+        size_powers = list(range(args.min_size, args.max_size + 1, args.step))
+    size_bytes = [2**p for p in size_powers]
+    return size_bytes, size_powers
 
 
 def main():
@@ -769,13 +891,9 @@ def main():
     }
     dtype = dtype_map[args.dtype]
 
-    # Size range
-    if IS_CI:
-        size_range = range(10, 12)
-    else:
-        size_range = range(args.min_size, args.max_size + 1, args.step)
-
-    max_size_bytes = 2 ** max(size_range)
+    # Size list
+    size_bytes_list, size_powers = resolve_size_bytes(args)
+    max_size_bytes = max(size_bytes_list)
     benchmark.initialize_communicators(max_size_bytes=max_size_bytes)
 
     # Available implementations (full default set)
@@ -811,10 +929,9 @@ def main():
     # Filter to only available implementations
     implementations = [impl for impl in implementations if impl_available(impl)]
 
-    size_list = list(size_range)
     results = [
-        {"size_bytes": 2**size_power, "size_human": human_readable_size(2**size_power)}
-        for size_power in size_list
+        {"size_bytes": size_bytes, "size_human": human_readable_size(size_bytes)}
+        for size_bytes in size_bytes_list
     ]
     modes_to_run = ["eager", "graph"] if args.mode == "both" else [args.mode]
     check_ref = args.check_correctness and "torch_native" in implementations
@@ -844,8 +961,7 @@ def main():
 
     with prof_ctx as prof:
         for mode in modes_to_run:
-            for idx, size_power in enumerate(size_list):
-                size_bytes = 2**size_power
+            for idx, size_bytes in enumerate(size_bytes_list):
 
                 # Skip if too large (cap total tensor bytes)
                 if size_bytes > 2**31:
@@ -981,21 +1097,69 @@ def main():
                 )
                 for mode in modes_to_run
             }
+            guard_details_by_mode = (
+                {
+                    mode: build_guard_details(
+                        results=results,
+                        implementations=implementations,
+                        benchmark=benchmark,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    for mode in modes_to_run
+                }
+                if args.export_guard_details
+                else None
+            )
             meta = {
                 "device_name": device_name,
                 "world_size": world_size,
                 "dtype": args.dtype,
                 "modes": modes_to_run,
                 "impls": implementations,
-                "size_powers": size_list,
-                "min_size_power": args.min_size,
-                "max_size_power": args.max_size,
-                "step": args.step,
+                "size_bytes": size_bytes_list,
                 "respect_impl_constraints": args.respect_impl_constraints,
                 "timestamp_utc": datetime.utcnow().isoformat() + "Z",
             }
-            export_tuning_json(export_path, thresholds_by_mode, meta)
+            if size_powers is not None:
+                meta["size_powers"] = size_powers
+                meta["min_size_power"] = args.min_size
+                meta["max_size_power"] = args.max_size
+                meta["step"] = args.step
+            export_tuning_json(
+                export_path, thresholds_by_mode, meta, guard_details_by_mode
+            )
             print(f"\nTuning data exported to {export_path}")
+
+            if args.export_guard_aware:
+                guard_suffix = (
+                    f"amd_ar_tuning_{safe_device_name}_ws{world_size}_"
+                    f"{args.dtype}_{modes_label}_guard_aware.json"
+                )
+                guard_export_path = resolve_export_path(
+                    args.export_tuning, guard_suffix
+                )
+                guard_thresholds_by_mode = {
+                    mode: build_tuning_thresholds(
+                        results=results,
+                        mode=mode,
+                        implementations=implementations,
+                        benchmark=benchmark,
+                        device=device,
+                        dtype=dtype,
+                        respect_impl_constraints=True,
+                    )
+                    for mode in modes_to_run
+                }
+                guard_meta = dict(meta)
+                guard_meta["respect_impl_constraints"] = True
+                export_tuning_json(
+                    guard_export_path,
+                    guard_thresholds_by_mode,
+                    guard_meta,
+                    guard_details_by_mode,
+                )
+                print(f"Guard-aware tuning data exported to {guard_export_path}")
 
     # Export profile if enabled
     if args.profile and rank == 0 and prof is not None:

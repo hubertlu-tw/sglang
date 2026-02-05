@@ -11,8 +11,9 @@ This schema describes the JSON produced by
   - `dtype`: `"float16" | "bfloat16" | "float32"`.
   - `modes`: list of modes included, e.g. `["eager", "graph"]`.
   - `impls`: list of implementations considered.
-  - `size_powers`: list of size exponents (powers of 2).
-  - `min_size_power`, `max_size_power`, `step`: benchmark size range.
+  - `size_bytes`: list of explicit sizes in bytes (when provided).
+  - `size_powers`: list of size exponents (powers of 2, when used).
+  - `min_size_power`, `max_size_power`, `step`: benchmark size range (power-of-2 mode).
   - `respect_impl_constraints`: boolean.
   - `timestamp_utc`: ISO-8601 string.
 
@@ -22,6 +23,10 @@ This schema describes the JSON produced by
   - The list is ordered by increasing `max_size_bytes`.
   - For a given mode, the chosen implementation is the fastest for sizes up to
     `max_size_bytes`, then switches to the next entry.
+
+- `guards` (optional):
+  - Object keyed by mode, e.g. `{"eager": {...}, "graph": {...}}`.
+  - Each mode maps `size_bytes -> { impl: reason }` for guard failures at that size.
 
 ## Example
 
@@ -45,6 +50,13 @@ This schema describes the JSON produced by
       { "max_size_bytes": 65536, "impl": "custom_ar_sgl" },
       { "max_size_bytes": 131072, "impl": "quick_ar_fp" }
     ]
+  },
+  "guards": {
+    "graph": {
+      "65536": {
+        "custom_ar_aiter": "custom_ar_guard_failed"
+      }
+    }
   }
 }
 ```
