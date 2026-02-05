@@ -8,8 +8,8 @@ Supported implementations (AMD):
 - pynccl_comm.all_reduce
 - custom_ar (sgl-kernel)
 - custom_ar (aiter)
+- torch_symm_mem (torch symmetric memory)
 - quick_ar (FP, INT8, INT6, INT4)
-- outplace_all_reduce
 - inplace_all_reduce
 
 Usage:
@@ -36,6 +36,9 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce import (
 from sglang.srt.distributed.device_communicators.quick_all_reduce import (
     QuickAllReduce,
     qr_rocm_arch_available,
+)
+from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+    TorchSymmMemCommunicator,
 )
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
@@ -94,6 +97,13 @@ class AllReduceBenchmark:
         # Base communicators from group
         self.communicators["torch_native"] = group.device_group
         self.communicators["pynccl"] = group.pynccl_comm
+        torch_symm_mem_comm = TorchSymmMemCommunicator(
+            group=group.cpu_group, device=self.device
+        )
+        if torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
+            self.communicators["torch_symm_mem"] = torch_symm_mem_comm
+        else:
+            self.communicators["torch_symm_mem"] = None
 
         # Use the default gloo WORLD group for custom AR (aligns with benchmark_aiter.py)
         self.custom_ar_group = dist.group.WORLD
@@ -281,6 +291,19 @@ class AllReduceBenchmark:
 
             return pynccl_allreduce
 
+        elif impl_name == "torch_symm_mem":
+
+            def torch_symm_mem_allreduce(tensor: torch.Tensor) -> torch.Tensor:
+                comm = self.communicators.get("torch_symm_mem")
+                if comm is None:
+                    raise RuntimeError("torch_symm_mem communicator is not available")
+                output = comm.all_reduce(tensor)
+                if output is None:
+                    raise RuntimeError("torch_symm_mem all_reduce returned None")
+                return output
+
+            return torch_symm_mem_allreduce
+
         elif impl_name == "inplace_all_reduce":
 
             def inplace_allreduce(tensor: torch.Tensor) -> torch.Tensor:
@@ -327,6 +350,16 @@ class AllReduceBenchmark:
             if hasattr(self.group, "is_symmetric_memory_enabled"):
                 ok = self.group.is_symmetric_memory_enabled()
                 return ok, "ok" if ok else "pynccl_symm_mem_disabled"
+            return True, "ok"
+        if impl_name == "torch_symm_mem":
+            comm = self.communicators.get(impl_name)
+            if comm is None:
+                return False, "torch_symm_mem_comm_missing"
+            if getattr(comm, "disabled", False):
+                return False, "torch_symm_mem_disabled"
+            if hasattr(comm, "should_torch_symm_mem_allreduce"):
+                ok = comm.should_torch_symm_mem_allreduce(tensor)
+                return ok, "ok" if ok else "torch_symm_mem_guard_failed"
             return True, "ok"
         if impl_name in ("torch_native", "inplace_all_reduce"):
             return True, "ok"
@@ -902,6 +935,7 @@ def main():
         "pynccl",
         "custom_ar_sgl",
         "custom_ar_aiter",
+        "torch_symm_mem",
         "quick_ar_fp",
         "quick_ar_int8",
         "quick_ar_int6",
@@ -922,6 +956,9 @@ def main():
     def impl_available(impl: str) -> bool:
         if impl.startswith("quick_ar_"):
             return impl.split("_", 2)[2].lower() in benchmark.quick_ar_comms
+        if impl == "torch_symm_mem":
+            comm = benchmark.communicators.get(impl)
+            return comm is not None and not comm.disabled
         if impl in ("outplace_all_reduce", "inplace_all_reduce"):
             return benchmark.group is not None
         return benchmark.communicators.get(impl) is not None
