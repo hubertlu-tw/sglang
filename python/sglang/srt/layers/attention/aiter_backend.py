@@ -31,18 +31,28 @@ try:
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
-        get_ps_metadata_info_v1,
-        get_ps_metadata_v1,
         mha_batch_prefill_func,
-        mla_prefill_ps_asm_fwd,
         mla_reduce_v1,
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
+
+try:
+    from aiter import (
+        get_ps_metadata_info_v1,
+        get_ps_metadata_v1,
+        mla_prefill_ps_asm_fwd,
+    )
+except ImportError:
+    logging.warning("Aiter: get_ps_metadata_info_v1, get_ps_metadata_v1, mla_prefill_ps_asm_fwd not found")
+    get_ps_metadata_info_v1 = None
+    get_ps_metadata_v1 = None
+    mla_prefill_ps_asm_fwd = None
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import pad_sequence_with_mask
@@ -150,6 +160,18 @@ class AiterAttnBackend(AttentionBackend):
                 -1
             ]
 
+        if (
+            not self.use_mla
+            and self.num_draft_tokens is not None
+            and self.num_draft_tokens > 0
+        ):
+            logger.warning(
+                "Aiter backend: Non-MLA model with speculative decoding detected. "
+                "Using triton extend_attention_fwd kernel for speculative decoding "
+                "attention (TARGET_VERIFY/DRAFT_EXTEND) as mha_batch_prefill_func "
+                "does not support custom tree masks required for speculative decoding."
+            )
+
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
@@ -197,6 +219,10 @@ class AiterAttnBackend(AttentionBackend):
                 + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4,
                 dtype=torch.uint8,
                 device=self.device,
+            )
+            # mask_indptr buffer for non-MLA speculative decoding (custom mask support)
+            self.mask_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
@@ -604,6 +630,7 @@ class AiterAttnBackend(AttentionBackend):
                     custom_mask=custom_mask,
                     mask_indptr=None,
                     max_extend_len=draft_max_extend_len,
+                    run_graph=False,
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -729,6 +756,7 @@ class AiterAttnBackend(AttentionBackend):
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=draft_num,
+                    run_graph=False,
                 )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -1058,7 +1086,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
                 seq_mask_len = draft_num * (seq_lens + draft_num)
                 mask_indptr = self.mask_indptr
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
@@ -1411,6 +1442,98 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+
+        if forward_mode.is_decode_or_idle():
+            kv_indptr = self.kv_indptr
+            kv_indices = self.cuda_graph_kv_indices
+            if spec_info is None:
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+            else:
+                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
+                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+
+        elif forward_mode.is_target_verify():
+            bs = len(req_pool_indices)
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * self.num_draft_tokens,
+                step=self.num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if self.use_mla:
+                kv_lens = seq_lens + self.num_draft_tokens
+            else:
+                kv_lens = seq_lens
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            # Non-MLA: update custom_mask and mask_indptr for extend_attention_fwd
+            if not self.use_mla:
+                custom_mask = self.cuda_graph_custom_mask
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
+                seq_mask_len = self.num_draft_tokens * (
+                    seq_lens + self.num_draft_tokens
+                )
+                mask_indptr = self.mask_indptr[: bs + 1]
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+
+        elif forward_mode.is_draft_extend():
+            seq_lens = seq_lens[:bs]
+            accept_lens = spec_info.accept_length[:bs]
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+        else:
             raise ValueError("Invalid forward mode")
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -1750,11 +1873,11 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
-                # Use triton extend kernel which supports custom masks and causal masking
+            # Non-MLA path
+            if self.forward_metadata.custom_mask is not None:
+                # Speculative decoding path (TARGET_VERIFY / DRAFT_EXTEND):
+                # Use extend_attention_fwd which supports custom tree masks.
+                # mha_batch_prefill_func does not support custom masks.
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -1762,54 +1885,65 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
+                # Note: KV cache save already happened at the top of forward_extend
                 self.extend_attention_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
+                    q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.qk_head_dim
+                    ),
+                    k.contiguous().view(
+                        -1, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v.contiguous().view(
+                        -1, layer.tp_v_head_num, layer.v_head_dim
+                    ),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    forward_batch.token_to_kv_pool.get_value_buffer(
+                        layer.layer_id
+                    ),
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
                     self.forward_metadata.custom_mask,
                     True,  # causal
                     self.forward_metadata.mask_indptr,
-                    self.forward_metadata.max_extend_len,
+                    self.forward_metadata.max_extend_len
+                    or self.forward_metadata.max_q_len,
                     layer.scaling,
                     logit_cap=layer.logit_cap,
                 )
-                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                return o
+            else:
+                # Regular extend path: use mha_batch_prefill_func
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
 
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+                bs0 = forward_batch.batch_size + 1
 
-            bs0 = forward_batch.batch_size + 1
+                # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+                if self.kv_cache_dtype == fp8_dtype:
+                    dtype = q.dtype
+                    k_cache = k_cache.to(dtype)
+                    v_cache = v_cache.to(dtype)
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                o = mha_batch_prefill_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                )
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-            )
-
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,
