@@ -26,6 +26,7 @@ git checkout amd-fork/feat/suffix-decoding-amd
 
 ```bash
 cd sgl-kernel
+pip uninstall sgl-kernel
 python setup_rocm.py install
 ```
 
