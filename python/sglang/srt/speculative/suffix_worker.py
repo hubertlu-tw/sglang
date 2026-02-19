@@ -101,7 +101,20 @@ class SuffixWorker(NGRAMWorker):
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
         """
         Override to set batch.spec_algorithm to SUFFIX and use SuffixVerifyInput.
-        Also constructs the correct attention mask handling duplicate roots.
+
+        Builds the custom attention mask for the triton extend_attention_fwd kernel
+        used on AMD/ROCm (non-MLA path).
+
+        Key design: the mask uses (seq_len - 1) prefix columns so that the
+        committed root token at KV position seq_len-1 is excluded from the
+        stage-1 prefix attention.  This avoids the "duplicate root" problem
+        where the same token would be attended at two different positions
+        (committed @ seq_len-1 and draft @ seq_len), corrupting RoPE-based
+        relative position scores.  To make this work, batch.seq_lens is
+        decremented by 1 in forward_batch_generation() before the model
+        forward pass, so the kernel's mask_indptr expectation of
+        draft_num * (seq_lens + draft_num) matches the mask width of
+        (seq_len - 1) + draft_num per row.
         """
         if batch.forward_mode.is_extend():
             return
@@ -131,35 +144,21 @@ class SuffixWorker(NGRAMWorker):
         )
 
         if USE_FULL_MASK:
-            # Reconstruct mask for non-MLA backend (extend_attention_fwd)
-            # SuffixCacheAdapter injects the last verified token (root) at index 0.
-            # extend_attention_fwd appends all draft tokens to KV cache.
-            # So the root token appears twice: at K[seq_len-1] and K[seq_len].
-            # We must mask out the duplicate at K[seq_len] and ensure attention points to K[seq_len-1].
-            
+            # Reuse the exact same mask construction as NGRAMWorker.
+            # This produces [ones(draft_num, seq_len-1) | tree_mask(draft_num, draft_num)]
+            # which is the layout expected by the tree verification pipeline.
             tree_mask = []
             mask = mask.reshape(
                 batch.batch_size(), self.draft_token_num, self.draft_token_num
             )
             for i, req in enumerate(batch.reqs):
                 seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                
-                # 1. Prefix mask: All ones up to seq_len - 1 (excludes duplicate root)
-                col_prefix = torch.ones((self.draft_token_num, seq_len - 1), dtype=torch.bool, device="cuda")
-                
-                # 2. Root mask: Use mask[:, 0] to attend to original root at K[seq_len-1]
-                col_root = torch.from_numpy(mask[i, :, 0:1]).to(device="cuda", dtype=torch.bool)
-                
-                # 3. Duplicate root mask: All zeros for K[seq_len]
-                col_zero = torch.zeros((self.draft_token_num, 1), dtype=torch.bool, device="cuda")
-                
-                # 4. Speculative mask: Use mask[:, 1:] for remaining draft tokens
-                col_spec = torch.from_numpy(mask[i, :, 1:]).to(device="cuda", dtype=torch.bool)
-                
-                # Concatenate all parts
+                req_mask = torch.ones(
+                    (self.draft_token_num, seq_len - 1)
+                ).cuda()
                 req_mask = torch.cat(
-                    (col_prefix, col_root, col_zero, col_spec), dim=1
-                )
+                    (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
+                ).to(torch.bool)
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
 
