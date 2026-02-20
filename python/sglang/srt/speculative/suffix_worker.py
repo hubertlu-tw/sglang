@@ -3,6 +3,13 @@ Suffix decoding worker that reuses NGRAMWorker with a cache adapter.
 
 This is a thin wrapper that replaces NgramCache with SuffixCacheAdapter,
 allowing all the tree-based verification logic to be reused.
+
+Performance optimizations over the base implementation:
+- Numpy-based full-mask construction (single CPU→GPU transfer instead of
+  per-request torch.ones().cuda() + torch.cat() allocations)
+- O(n) BFS ancestor propagation in tree mask building (replaces O(n×d)
+  while-loops)
+- Throttled inactive-request cleanup in the cache adapter
 """
 
 import logging
@@ -29,7 +36,8 @@ class SuffixWorker(NGRAMWorker):
     Suffix decoding worker that inherits from NGRAMWorker.
 
     The only difference is using SuffixCacheAdapter instead of NgramCache.
-    All tree-based verification logic is inherited from NGRAMWorker.
+    All tree-based verification logic is inherited from NGRAMWorker,
+    including forward_batch_generation.
     """
 
     def __init__(
@@ -64,31 +72,29 @@ class SuffixWorker(NGRAMWorker):
 
     def _prepare_draft_tokens(self, batch):
         """
-        Override to pass FULL token sequences to the cache adapter.
+        Override to pass token sequences to the cache adapter.
 
         NGRAMWorker passes only last N tokens, but the suffix cache needs:
         1. Full prompt for start_request()
-        2. Full sequence for suffix tree building
+        2. Output IDs for incremental cache updates
         3. Request identity tracking
-        """
 
+        Passes origin_input_ids and output_ids *separately* to avoid
+        O(seq_len) list concatenation per request per step.
+        """
         bs = batch.batch_size()
 
         self.ngram_cache.synchronize()
         batch_req_ids = []
         batch_prompts = []
-        batch_tokens = []
+        batch_output_ids = []
         for req in batch.reqs:
-            # Pass request ID for stable tracking
             batch_req_ids.append(req.rid)
-            # Pass prompt separately (for cache initialization)
             batch_prompts.append(req.origin_input_ids)
-            # Pass FULL token sequence (prompt + outputs), not just last N
-            full_tokens = req.origin_input_ids + req.output_ids
-            batch_tokens.append(full_tokens)
+            batch_output_ids.append(req.output_ids)
 
         req_drafts, mask = self.ngram_cache.batch_get(
-            batch_req_ids, batch_prompts, batch_tokens
+            batch_req_ids, batch_prompts, batch_output_ids
         )
         total_draft_token_num = len(req_drafts)
 
@@ -102,19 +108,12 @@ class SuffixWorker(NGRAMWorker):
         """
         Override to set batch.spec_algorithm to SUFFIX and use SuffixVerifyInput.
 
-        Builds the custom attention mask for the triton extend_attention_fwd kernel
-        used on AMD/ROCm (non-MLA path).
+        Builds the custom attention mask for the triton extend_attention_fwd
+        kernel used on AMD/ROCm (non-MLA path).
 
-        Key design: the mask uses (seq_len - 1) prefix columns so that the
-        committed root token at KV position seq_len-1 is excluded from the
-        stage-1 prefix attention.  This avoids the "duplicate root" problem
-        where the same token would be attended at two different positions
-        (committed @ seq_len-1 and draft @ seq_len), corrupting RoPE-based
-        relative position scores.  To make this work, batch.seq_lens is
-        decremented by 1 in forward_batch_generation() before the model
-        forward pass, so the kernel's mask_indptr expectation of
-        draft_num * (seq_lens + draft_num) matches the mask width of
-        (seq_len - 1) + draft_num per row.
+        Performance: the full-mask is built with numpy on CPU and transferred
+        to GPU in a single copy, avoiding per-request torch.ones().cuda() +
+        torch.cat() allocations.
         """
         if batch.forward_mode.is_extend():
             return
@@ -144,23 +143,22 @@ class SuffixWorker(NGRAMWorker):
         )
 
         if USE_FULL_MASK:
-            # Reuse the exact same mask construction as NGRAMWorker.
-            # This produces [ones(draft_num, seq_len-1) | tree_mask(draft_num, draft_num)]
-            # which is the layout expected by the tree verification pipeline.
-            tree_mask = []
-            mask = mask.reshape(
-                batch.batch_size(), self.draft_token_num, self.draft_token_num
-            )
+            # Build [ones(draft_num, seq_len-1) | tree_mask(draft_num, draft_num)]
+            # using numpy on CPU, then do a single transfer to GPU.
+            # This avoids per-request torch.ones().cuda() + torch.cat() allocations.
+            mask_reshaped = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
+            parts = []
             for i, req in enumerate(batch.reqs):
                 seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                req_mask = torch.ones(
-                    (self.draft_token_num, seq_len - 1)
-                ).cuda()
-                req_mask = torch.cat(
-                    (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+                width = (seq_len - 1) + self.draft_token_num
+                full_mask = np.ones(
+                    (self.draft_token_num, width), dtype=np.bool_
+                )
+                full_mask[:, seq_len - 1 :] = mask_reshaped[i]
+                parts.append(full_mask.ravel())
+            tree_mask = torch.from_numpy(np.concatenate(parts)).to(
+                device=batch.seq_lens.device
+            )
 
         batch.spec_algorithm = SpeculativeAlgorithm.SUFFIX
         batch.forward_mode = ForwardMode.TARGET_VERIFY
@@ -177,15 +175,8 @@ class SuffixWorker(NGRAMWorker):
 
     def _update_ngram_cache(self, batch):
         """
-        Override to pass FULL token sequences for cache updates.
+        No-op override.  The suffix cache is updated incrementally inside
+        batch_get() (before speculation), so there is nothing to do here.
+        Skipping avoids an O(bs × seq_len) list construction per step.
         """
-        batch_req_ids = []
-        batch_tokens = []
-        for req in batch.reqs:
-            # Pass request ID for stable tracking
-            batch_req_ids.append(req.rid)
-            # Pass FULL token sequence for delta computation
-            full_tokens = req.origin_input_ids + req.output_ids
-            batch_tokens.append(full_tokens)
-
-        self.ngram_cache.batch_put(batch_req_ids, batch_tokens)
+        pass
