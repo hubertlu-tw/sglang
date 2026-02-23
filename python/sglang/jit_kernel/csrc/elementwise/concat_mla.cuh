@@ -5,43 +5,97 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
+#endif
 
 namespace {
 
 // ======================= Memory Utilities =======================
 // Adapted from DeepEP: https://github.com/deepseek-ai/DeepEP/blob/main/csrc/kernels/utils.cuh
 
+constexpr int kLogicalWarpThreads = 32;
+
 SGL_DEVICE int get_lane_id() {
+#ifdef USE_ROCM
+  return static_cast<int>(threadIdx.x) % kLogicalWarpThreads;
+#else
   int lane_id;
   asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
   return lane_id;
+#endif
 }
 
 SGL_DEVICE void st_na_global_v1(const int* ptr, int v) {
+#ifdef USE_ROCM
+  *const_cast<int*>(ptr) = v;
+#else
   asm volatile("st.global.L1::no_allocate.s32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
+#endif
 }
 
 SGL_DEVICE void st_na_global_v2(const int2* ptr, const int2& v) {
+#ifdef USE_ROCM
+  *const_cast<int2*>(ptr) = v;
+#else
   asm volatile("st.global.L1::no_allocate.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(v.x), "r"(v.y) : "memory");
+#endif
+}
+
+SGL_DEVICE void st_na_global_v4(const int4* ptr, const int4& v) {
+#ifdef USE_ROCM
+  *const_cast<int4*>(ptr) = v;
+#else
+  asm volatile("st.global.L1::no_allocate.v4.s32 [%0], {%1, %2, %3, %4};"
+               :
+               : "l"(ptr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+               : "memory");
+#endif
 }
 
 SGL_DEVICE int ld_na_global_v1(const int* ptr) {
+#ifdef USE_ROCM
+  return *ptr;
+#else
   int r;
   asm volatile("ld.global.nc.L1::no_allocate.s32 %0, [%1];" : "=r"(r) : "l"(ptr));
   return r;
+#endif
 }
 
 SGL_DEVICE int2 ld_na_global_v2(const int2* ptr) {
+#ifdef USE_ROCM
+  return *ptr;
+#else
   int2 r;
   asm volatile("ld.global.nc.L1::no_allocate.v2.s32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(ptr));
   return r;
+#endif
+}
+
+SGL_DEVICE int4 ld_na_global_v4(const int4* ptr) {
+#ifdef USE_ROCM
+  return *ptr;
+#else
+  int4 r;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(ptr));
+  return r;
+#endif
 }
 
 SGL_DEVICE void prefetch_L2(const void* p) {
+#ifdef USE_ROCM
+  (void)p;
+#else
 #if defined(ENABLE_L2_PREFETCH)
   asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+#endif
 #endif
 }
 
@@ -51,6 +105,11 @@ constexpr int NUM_LOCAL_HEADS = 128;
 constexpr int QK_NOPE_HEAD_DIM = 128;
 constexpr int QK_ROPE_HEAD_DIM = 64;
 constexpr int K_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
+#ifdef USE_ROCM
+constexpr DLDeviceType kDLGPUDeviceType = kDLROCM;
+#else
+constexpr DLDeviceType kDLGPUDeviceType = kDLCUDA;
+#endif
 
 constexpr int HEAD_CHUNK_SIZE = 16;
 constexpr int NUM_HEAD_CHUNKS = NUM_LOCAL_HEADS / HEAD_CHUNK_SIZE;
@@ -65,16 +124,65 @@ __global__ void concat_mla_k_kernel(
     const int64_t k_nope_stride_0,
     const int k_nope_stride_1,
     const int64_t k_rope_stride_0) {
-  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / kLogicalWarpThreads;
   const int token_id = flat_warp_id / NUM_HEAD_CHUNKS;
   const int head_chunk_id = flat_warp_id % NUM_HEAD_CHUNKS;
   const int lane_id = get_lane_id();
   if (token_id >= num_tokens) return;
 
+#ifdef USE_ROCM
+  constexpr int kNopeActiveLanes = 16;
+  constexpr int kRopeActiveLanes = 16;
+  if (lane_id >= kNopeActiveLanes) return;
+
+  using NopeVec = int4;  // 16B/thread, 16 threads = 256B/row
+  using RopeVec = int2;  // 8B/thread, 16 threads = 128B/row
+  static_assert(sizeof(NopeVec) * kNopeActiveLanes == QK_NOPE_HEAD_DIM * sizeof(bf16_t), "nope vec mismatch");
+  static_assert(sizeof(RopeVec) * kRopeActiveLanes == QK_ROPE_HEAD_DIM * sizeof(bf16_t), "rope vec mismatch");
+
+  const int head_row0 = head_chunk_id * HEAD_CHUNK_SIZE;
+
+  const int4* __restrict__ nope_src =
+      reinterpret_cast<const int4*>(k_nope + token_id * k_nope_stride_0 + head_row0 * k_nope_stride_1) + lane_id;
+
+  int4* __restrict__ nope_dst = reinterpret_cast<int4*>(k + token_id * k_stride_0 + head_row0 * k_stride_1) + lane_id;
+
+  int2* __restrict__ rope_dst =
+      reinterpret_cast<int2*>(k + token_id * k_stride_0 + head_row0 * k_stride_1 + QK_NOPE_HEAD_DIM) + lane_id;
+
+  const int nope_src_stride_v = (k_nope_stride_1 >> 3);  // int4 covers 8 bf16
+  const int nope_dst_stride_v = (k_stride_1 >> 3);
+  const int rope_dst_stride_v = (k_stride_1 >> 2);  // int2 covers 4 bf16
+
+  const int2* rope_base = reinterpret_cast<const int2*>(k_rope + token_id * k_rope_stride_0);
+  const RopeVec rope_val = rope_base[lane_id];
+
+  prefetch_L2(nope_src);
+  NopeVec cur = ld_na_global_v4(nope_src);
+
+#pragma unroll
+  for (int i = 0; i < HEAD_CHUNK_SIZE; ++i) {
+    NopeVec next;
+    if (i + 1 < HEAD_CHUNK_SIZE) {
+      const int4* next_src = nope_src + nope_src_stride_v;
+      prefetch_L2(next_src);
+      next = ld_na_global_v4(next_src);
+    }
+
+    st_na_global_v4(nope_dst, cur);
+    *rope_dst = rope_val;
+
+    nope_src += nope_src_stride_v;
+    nope_dst += nope_dst_stride_v;
+    rope_dst += rope_dst_stride_v;
+
+    cur = next;
+  }
+#else
   using NopeVec = int2;  // 8B/thread, 32 threads = 256B/row
   using RopeVec = int;   // 4B/thread, 32 threads = 128B/row
-  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(bf16_t), "nope vec mismatch");
-  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(bf16_t), "rope vec mismatch");
+  static_assert(sizeof(NopeVec) * kLogicalWarpThreads == QK_NOPE_HEAD_DIM * sizeof(bf16_t), "nope vec mismatch");
+  static_assert(sizeof(RopeVec) * kLogicalWarpThreads == QK_ROPE_HEAD_DIM * sizeof(bf16_t), "rope vec mismatch");
 
   const int head_row0 = head_chunk_id * HEAD_CHUNK_SIZE;
 
@@ -114,6 +222,7 @@ __global__ void concat_mla_k_kernel(
 
     cur = next;
   }
+#endif
 }
 
 struct ConcatMlaKKernel {
@@ -139,20 +248,24 @@ struct ConcatMlaKKernel {
     D_rope.set_value(QK_ROPE_HEAD_DIM);
 
     // Verify k: [num_tokens, num_heads, k_head_dim]
-    TensorMatcher({N, H, D}).with_strides({S0_k, S1_k, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(k);
+    TensorMatcher({N, H, D})
+        .with_strides({S0_k, S1_k, 1})
+        .with_dtype<bf16_t>()
+        .with_device<kDLGPUDeviceType>(device)
+        .verify(k);
 
     // Verify k_nope: [num_tokens, num_heads, nope_head_dim]
     TensorMatcher({N, H, D_nope})
         .with_strides({S0_k_nope, S1_k_nope, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLGPUDeviceType>(device)
         .verify(k_nope);
 
     // Verify k_rope: [num_tokens, 1, rope_head_dim]
     TensorMatcher({N, 1, D_rope})
         .with_strides({S0_k_rope, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLGPUDeviceType>(device)
         .verify(k_rope);
 
     // Check alignment
@@ -162,9 +275,13 @@ struct ConcatMlaKKernel {
 
     const int num_tokens = static_cast<int>(N.unwrap());
 
-    constexpr int num_warps_per_block = 32;
-    const int grid_size = div_ceil(num_tokens * NUM_HEAD_CHUNKS, num_warps_per_block);
-    const int block_size = num_warps_per_block * 32;
+#ifdef USE_ROCM
+    constexpr int num_logical_warps_per_block = 8;
+#else
+    constexpr int num_logical_warps_per_block = 32;
+#endif
+    const int grid_size = div_ceil(num_tokens * NUM_HEAD_CHUNKS, num_logical_warps_per_block);
+    const int block_size = num_logical_warps_per_block * kLogicalWarpThreads;
 
     LaunchKernel(grid_size, block_size, device.unwrap())(
         concat_mla_k_kernel,
@@ -198,7 +315,7 @@ __global__ void concat_mla_absorb_q_kernel(
     const int b_stride_1,
     const int64_t out_stride_0,
     const int out_stride_1) {
-  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / kLogicalWarpThreads;
   const int lane_id = get_lane_id();
 
   const int idx_0 = flat_warp_id / dim_1;
@@ -210,12 +327,12 @@ __global__ void concat_mla_absorb_q_kernel(
 
   using ABufType = int4;
   constexpr int A_NUM_UNROLL = 2;
-  static_assert(sizeof(ABufType) * A_NUM_UNROLL == A_LAST_DIM * sizeof(a[0]) / 32);
+  static_assert(sizeof(ABufType) * A_NUM_UNROLL == A_LAST_DIM * sizeof(a[0]) / kLogicalWarpThreads);
   ABufType a_buf[A_NUM_UNROLL];
 
   using BBufType = int;
   constexpr int B_NUM_UNROLL = 1;
-  static_assert(sizeof(BBufType) * B_NUM_UNROLL == B_LAST_DIM * sizeof(b[0]) / 32);
+  static_assert(sizeof(BBufType) * B_NUM_UNROLL == B_LAST_DIM * sizeof(b[0]) / kLogicalWarpThreads);
   BBufType b_buf;
 
   {
@@ -226,7 +343,7 @@ __global__ void concat_mla_absorb_q_kernel(
 #pragma unroll
   for (int i = 0; i < A_NUM_UNROLL; ++i) {
     const ABufType* base_addr = reinterpret_cast<ABufType*>(a + idx_0 * a_stride_0 + idx_1 * a_stride_1);
-    a_buf[i] = *(base_addr + i * 32 + lane_id);
+    a_buf[i] = *(base_addr + i * kLogicalWarpThreads + lane_id);
   }
 
   {
@@ -237,7 +354,7 @@ __global__ void concat_mla_absorb_q_kernel(
 #pragma unroll
   for (int i = 0; i < A_NUM_UNROLL; ++i) {
     ABufType* base_addr = reinterpret_cast<ABufType*>(out + idx_0 * out_stride_0 + idx_1 * out_stride_1);
-    *(base_addr + i * 32 + lane_id) = a_buf[i];
+    *(base_addr + i * kLogicalWarpThreads + lane_id) = a_buf[i];
   }
 }
 
@@ -271,21 +388,21 @@ struct ConcatMlaAbsorbQKernel {
     TensorMatcher({N0_a, N1_a, D_a})
         .with_strides({S0_a, S1_a, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLGPUDeviceType>(device)
         .verify(a);
 
     // Verify b: [dim_0, dim_1, B_LAST_DIM]
     TensorMatcher({N0_b, N1_b, D_b})
         .with_strides({S0_b, S1_b, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLGPUDeviceType>(device)
         .verify(b);
 
     // Verify out: [dim_0, dim_1, OUT_LAST_DIM]
     TensorMatcher({N0_out, N1_out, D_out})
         .with_strides({S0_out, S1_out, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLGPUDeviceType>(device)
         .verify(out);
 
     // Check alignment
@@ -302,9 +419,13 @@ struct ConcatMlaAbsorbQKernel {
     const int num_items = static_cast<int>(N0_a.unwrap() * N1_a.unwrap());
     const int dim_1 = static_cast<int>(N1_a.unwrap());
 
-    constexpr int num_warps_per_block = 32;
-    const int grid_size = div_ceil(num_items, num_warps_per_block);
-    const int block_size = num_warps_per_block * 32;
+#ifdef USE_ROCM
+    constexpr int num_logical_warps_per_block = 16;
+#else
+    constexpr int num_logical_warps_per_block = 32;
+#endif
+    const int grid_size = div_ceil(num_items, num_logical_warps_per_block);
+    const int block_size = num_logical_warps_per_block * kLogicalWarpThreads;
 
     LaunchKernel(grid_size, block_size, device.unwrap())(
         concat_mla_absorb_q_kernel,

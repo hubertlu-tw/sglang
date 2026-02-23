@@ -1,4 +1,5 @@
 import itertools
+import os
 
 import torch
 import triton
@@ -9,6 +10,7 @@ from sgl_kernel import concat_mla_k as aot_k
 from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.jit_kernel.concat_mla import concat_mla_absorb_q as jit_absorb_q
 from sglang.jit_kernel.concat_mla import concat_mla_k as jit_k
+from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 
 IS_CI = is_in_ci()
 
@@ -36,6 +38,16 @@ def _run_bench(fn):
     return triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
 
+def _parse_int_list_env(name: str):
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    if not vals:
+        raise ValueError(f"{name} is set but empty")
+    return vals
+
+
 def aot_concat_mla_k(k, k_nope, k_rope):
     aot_k(k, k_nope, k_rope)
 
@@ -48,6 +60,10 @@ def torch_concat_mla_k(k, k_nope, k_rope):
     nope_head_dim = k_nope.shape[-1]
     k[:, :, :nope_head_dim] = k_nope
     k[:, :, nope_head_dim:] = k_rope.expand(-1, k.shape[1], -1)
+
+
+def triton_concat_and_cast_mla_k(k, k_nope, k_rope):
+    concat_and_cast_mha_k_triton(k, k_nope, k_rope)
 
 
 def aot_concat_mla_absorb_q(a, b):
@@ -69,13 +85,19 @@ if IS_CI:
 else:
     NUM_TOKENS_VALS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
-K_LINE_VALS = (["aot"] if HAS_AOT_CONCAT_MLA_K else []) + ["jit", "torch"]
+K_LINE_VALS = (["aot"] if HAS_AOT_CONCAT_MLA_K else []) + [
+    "jit",
+    "triton_concat_cast",
+    "torch",
+]
 K_LINE_NAMES = (["SGL AOT Kernel"] if HAS_AOT_CONCAT_MLA_K else []) + [
     "SGL JIT Kernel",
+    "Triton concat_and_cast_mha_k",
     "PyTorch",
 ]
 K_STYLES = ([("orange", "-")] if HAS_AOT_CONCAT_MLA_K else []) + [
     ("blue", "--"),
+    ("red", ":"),
     ("green", "-."),
 ]
 
@@ -123,6 +145,7 @@ def bench_concat_mla_k(num_tokens: int, provider: str):
     FN_MAP = {
         "aot": aot_concat_mla_k,
         "jit": jit_concat_mla_k,
+        "triton_concat_cast": triton_concat_and_cast_mla_k,
         "torch": torch_concat_mla_k,
     }
     fn = lambda: FN_MAP[provider](k, k_nope, k_rope)
@@ -193,5 +216,6 @@ if __name__ == "__main__":
             "[bench_concat_mla] AOT ops missing in current sgl_kernel build; "
             "running with available providers only."
         )
+    print(f"[bench_concat_mla] K benchmark token sizes: {NUM_TOKENS_VALS}")
     bench_concat_mla_k.run(print_data=True)
     bench_concat_mla_absorb_q.run(print_data=True)
