@@ -76,20 +76,62 @@ python3 -m sglang.launch_server \
 
 ---
 
-## Performance Optimizations
+## How the Pipeline Works
 
-The suffix cache adapter and worker include several optimizations to reduce Python-side overhead:
+Suffix decoding adds a **speculate → verify** loop around the normal autoregressive decode step. Every decode iteration runs through the stages below. The entire pipeline is **synchronous** - the scheduler blocks until all stages finish before scheduling the next batch.
 
-- **Numpy-based mask construction**: The full attention mask is built on CPU with numpy and transferred to GPU in a single copy, replacing per-request `torch.ones().cuda()` + `torch.cat()` allocations.
-- **O(n) BFS ancestor propagation**: Tree masks are built with a single forward pass over BFS-ordered nodes instead of O(n×d) nested while-loops.
-- **Throttled cleanup**: Inactive-request pruning in the cache adapter runs every 8 calls instead of every step.
+```
+  One Suffix Decoding Iteration (synchronous)
+
+  ┌──────────────────┐  ┌────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────────────┐  ┌────────────────┐
+  │ 1. Draft Prep    │→ │ 2. CPU→GPU │→ │ 3. Index       │→ │ 4. Full Attn   │→ │ 5. Model Forward │→ │ 6. Tree Verify │
+  │                  │  │  Transfer  │  │  Reconstruction│  │  Mask          │  │                  │  │                │
+  │ • update cache   │  │            │  │                │  │                │  │ target model on  │  │ greedy verify  │
+  │ • suffix tree    │  │ masks +    │  │ build indices, │  │ [ones|tree]    │  │ all draft tokens │  │ walk accepted  │
+  │   lookup         │  │ draft IDs  │  │ positions      │  │ per request    │  │ produce logits   │  │ path, select   │
+  │ • BFS reorder    │  │            │  │                │  │ numpy → GPU    │  │                  │  │ final logits   │
+  │ • mask build     │  │            │  │                │  │                │  │                  │  │                │
+  └──────────────────┘  └────────────┘  └────────────────┘  └────────────────┘  └──────────────────┘  └────────────────┘
+        CPU only            H2D              GPU only          CPU+GPU (AMD)          GPU only              GPU only
+```
+
+### Stage Details
+
+| Stage | Device | What Happens |
+|---|---|---|
+| **1. Draft preparation** | CPU | Update suffix cache with verified tokens, search the suffix tree for pattern matches (`suffix_cache.speculate`), BFS-reorder nodes, inject root node, build tree mask (numpy). This is the most expensive stage on CPU, ~20% of the total workload. |
+| **2. CPU→GPU transfer** | CPU→GPU | Copy tree mask and draft token IDs to GPU. |
+| **3. Index reconstruction** | GPU | `reconstruct_indices_from_tree_mask` kernel builds retrieval indices and position offsets. |
+| **4. Full attention mask** | CPU+GPU | *(AMD / non-MLA only)* Build per-request `[ones | tree_mask]` with numpy, transfer to GPU in one copy. |
+| **5. Model forward pass** | GPU | Run the full target model on all draft tokens (`batch_size × draft_token_num` tokens). This is the most expensive stage on GPU, ~60% of the total workload. |
+| **6. Tree verification** | GPU | Greedy verification kernel walks the draft tree, accepts matching tokens, selects final logits. |
+
+The result of each iteration is **1–N accepted tokens** per request (vs. exactly 1 in normal decode).
+**Trade-off: Each step is longer than normal Decode (more tokens through the model), but produces more (1-N) tokens, so wall-clock time per token is lower when the acceptance rate is high.**
+
 
 ---
 
 ## AMD-Specific Notes
 
-- **Greedy verification** works out of the box on AMD (ROCm).
-- **Sampling verification** (temperature / top-p / top-k) is **not available** on AMD — the sampling kernels are not compiled for ROCm. Speculative verification always uses greedy on AMD GPUs.
+The core suffix decoding logic is adapted from [PR #13553](https://github.com/sgl-project/sglang/pull/13553) (NVIDIA-only). This PR adds full AMD/ROCm support and several performance optimizations.
+
+### AMD/ROCm Porting
+
+Changes made to enable suffix decoding on AMD:
+
+- **Non-MLA attention backend** (`aiter_backend.py`): Speculative decoding support for the AMD attention path — custom mask handling, metadata computation for draft-extend and target-verify modes, and CUDA graph capture for non-MLA tree verification.
+- **Greedy-only verification** (`ngram_info.py`): Forces greedy verification on ROCm because the sampling kernels are not compiled for HIP. Temperature / top-p / top-k are ignored during verification on AMD.
+- **ROCm kernel registration** (`common_extension_rocm.cc`, `setup_rocm.py`): Registered `verify_tree_greedy` in the ROCm build of sgl-kernel.
+
+### Performance Optimizations
+
+Optimizations to reduce Python-side overhead compared to the base PR:
+
+- **Numpy-based mask construction** (`suffix_worker.py`): Full attention mask built on CPU with numpy and transferred in a single copy, replacing per-request GPU allocations.
+- **O(n) BFS ancestor propagation** (`suffix_cache_adapter.py`): Tree masks built in one forward pass over BFS-ordered nodes instead of nested while-loops.
+- **No-copy output_ids** (`suffix_worker.py`, `suffix_cache_adapter.py`): Prompt and output tokens passed separately to avoid list concatenation per request per step.
+- **Throttled cleanup** (`suffix_cache_adapter.py`): Inactive-request pruning runs every 8 calls instead of every step.
 
 ---
 
@@ -105,6 +147,7 @@ Below is the complete list of files modified or added by the suffix decoding fea
 | `python/sglang/srt/speculative/suffix_info.py` | Data structures for suffix decoding verification (extends NgramVerifyInput). Adds SUFFIX_VERIFY spec input type and debug logging of accepted tokens. |
 | `python/sglang/srt/speculative/suffix_cache_adapter.py` | Adapter wrapping `arctic_inference.SuffixDecodingCache` to match the NgramCache interface. Handles BFS reordering, root injection, and tree mask construction. |
 | `docs/advanced_features/suffix_decoding.md` | This documentation file. |
+| `test/registered/spec/test_suffix_speculative_decoding.py` | Test suite adapted from [PR #13553](https://github.com/sgl-project/sglang/pull/13553). Config validation, algorithm registration, `SuffixVerifyInput` unit tests, and GSM8K integration tests for fa3/triton/flashinfer backends. |
 
 ### Modified Files
 
@@ -120,6 +163,36 @@ Below is the complete list of files modified or added by the suffix decoding fea
 | `python/sglang/srt/utils/common.py` | Added `is_arctic_inference_available()` utility function. |
 | `sgl-kernel/csrc/common_extension_rocm.cc` | Registered `verify_tree_greedy` kernel for the ROCm build. |
 | `sgl-kernel/setup_rocm.py` | Added `common_extension_rocm.cc` to the ROCm build sources. |
+
+---
+
+## Testing
+
+Unit tests (no GPU or server needed):
+
+```bash
+python -m pytest test/registered/spec/test_suffix_speculative_decoding.py -v -k "Configuration or VerifyInput or Registration"
+```
+
+Integration tests (launches a server and runs GSM8K evaluation automatically):
+
+```bash
+python -m pytest test/registered/spec/test_suffix_speculative_decoding.py -v -s -k "Decoding"
+```
+
+Or run the eval manually against your own running server:
+
+```bash
+# Terminal 1 — start the server (see Quick Start above)
+
+# Terminal 2 — run GSM8K eval once the server is up
+python -m sglang.test.few_shot_gsm8k \
+    --num-shots 5 --num-questions 200 --max-new-tokens 512 \
+    --parallel 128 --host http://127.0.0.1 --port 30000
+
+# Check speculative acceptance length
+curl http://127.0.0.1:30000/server_info | python -m json.tool | grep spec_accept
+```
 
 ---
 
