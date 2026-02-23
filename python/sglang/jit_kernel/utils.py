@@ -61,6 +61,9 @@ KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = [
+    flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
+]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
@@ -162,12 +165,9 @@ def load_jit(
     # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
     env_key = "TVM_FFI_CUDA_ARCH_LIST"
     env_existed = env_key in os.environ
-    base_cuda_cflags = DEFAULT_CUDA_CFLAGS
+    selected_cuda_cflags = DEFAULT_CUDA_CFLAGS
     if is_hip_runtime():
-        # HIP clang does not support this nvcc-only flag.
-        base_cuda_cflags = [
-            flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
-        ]
+        selected_cuda_cflags = DEFAULT_HIP_CFLAGS
         extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
@@ -177,7 +177,7 @@ def load_jit(
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=base_cuda_cflags + extra_cuda_cflags,
+            extra_cuda_cflags=selected_cuda_cflags + extra_cuda_cflags,
             extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
             extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
             build_directory=build_directory,

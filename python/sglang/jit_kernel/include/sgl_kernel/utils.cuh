@@ -25,8 +25,10 @@ using cudaStream_t = hipStream_t;
 using cudaLaunchConfig_t = hipLaunchConfig_t;
 using cudaLaunchAttribute = hipLaunchAttribute;
 inline constexpr auto cudaSuccess = hipSuccess;
+#define cudaStreamPerThread hipStreamPerThread
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+#define cudaLaunchKernel hipLaunchKernel
 #endif
 
 #ifndef USE_ROCM
@@ -44,21 +46,6 @@ using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 
 using fp32x4_t = float4;
 #else
-#include <hip/hip_bf16.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
-#ifndef __grid_constant__
-#define __grid_constant__
-#endif
-using cudaError_t = hipError_t;
-using cudaStream_t = hipStream_t;
-using cudaLaunchConfig_t = hipLaunchConfig_t;
-using cudaLaunchAttribute = hipLaunchAttribute;
-inline constexpr auto cudaSuccess = hipSuccess;
-#define cudaStreamPerThread hipStreamPerThread
-#define cudaGetErrorString hipGetErrorString
-#define cudaGetLastError hipGetLastError
-#define cudaLaunchKernel hipLaunchKernel
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __hip_bfloat16;
