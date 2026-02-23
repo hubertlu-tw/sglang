@@ -23,6 +23,17 @@ B_LAST_DIM = 64
 
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
+IS_HIP = torch.version.hip is not None
+HAS_AOT_CONCAT_MLA_K = hasattr(torch.ops.sgl_kernel, "concat_mla_k")
+HAS_AOT_CONCAT_MLA_ABSORB_Q = hasattr(torch.ops.sgl_kernel, "concat_mla_absorb_q")
+
+
+def _run_bench(fn):
+    quantiles = [0.5, 0.2, 0.8]
+    # ROCm graph-capture support can vary by call path; eager timing is safer.
+    if IS_HIP:
+        return triton.testing.do_bench(fn, quantiles=quantiles)
+    return triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
 
 def aot_concat_mla_k(k, k_nope, k_rope):
@@ -43,8 +54,8 @@ def aot_concat_mla_absorb_q(a, b):
     return aot_absorb_q(a, b)
 
 
-def jit_concat_mla_absorb_q(a, b):
-    return jit_absorb_q(a, b)
+def jit_concat_mla_absorb_q(a, b, out=None):
+    return jit_absorb_q(a, b, out=out)
 
 
 def torch_concat_mla_absorb_q(a, b, out):
@@ -58,9 +69,15 @@ if IS_CI:
 else:
     NUM_TOKENS_VALS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
-K_LINE_VALS = ["aot", "jit", "torch"]
-K_LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
-K_STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
+K_LINE_VALS = (["aot"] if HAS_AOT_CONCAT_MLA_K else []) + ["jit", "torch"]
+K_LINE_NAMES = (["SGL AOT Kernel"] if HAS_AOT_CONCAT_MLA_K else []) + [
+    "SGL JIT Kernel",
+    "PyTorch",
+]
+K_STYLES = ([("orange", "-")] if HAS_AOT_CONCAT_MLA_K else []) + [
+    ("blue", "--"),
+    ("green", "-."),
+]
 
 
 def _create_concat_mla_k_data(num_tokens):
@@ -109,8 +126,7 @@ def bench_concat_mla_k(num_tokens: int, provider: str):
         "torch": torch_concat_mla_k,
     }
     fn = lambda: FN_MAP[provider](k, k_nope, k_rope)
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = _run_bench(fn)
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
@@ -119,9 +135,15 @@ if IS_CI:
 else:
     ABSORB_Q_VALS = list(itertools.product([1, 4, 8, 16, 32], [1, 8, 32, 128]))
 
-Q_LINE_VALS = ["aot", "jit", "torch"]
-Q_LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
-Q_STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
+Q_LINE_VALS = (["aot"] if HAS_AOT_CONCAT_MLA_ABSORB_Q else []) + ["jit", "torch"]
+Q_LINE_NAMES = (["SGL AOT Kernel"] if HAS_AOT_CONCAT_MLA_ABSORB_Q else []) + [
+    "SGL JIT Kernel",
+    "PyTorch",
+]
+Q_STYLES = ([("orange", "-")] if HAS_AOT_CONCAT_MLA_ABSORB_Q else []) + [
+    ("blue", "--"),
+    ("green", "-."),
+]
 
 
 @triton.testing.perf_report(
@@ -140,24 +162,36 @@ Q_STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
 def bench_concat_mla_absorb_q(dim_0: int, dim_1: int, provider: str):
     a = torch.randn(dim_0, dim_1, A_LAST_DIM, dtype=DTYPE, device=DEVICE)
     b = torch.randn(dim_0, dim_1, B_LAST_DIM, dtype=DTYPE, device=DEVICE)
+    out = torch.empty(dim_0, dim_1, A_LAST_DIM + B_LAST_DIM, dtype=DTYPE, device=DEVICE)
 
     if provider == "torch":
-        out = torch.empty(
-            dim_0, dim_1, A_LAST_DIM + B_LAST_DIM, dtype=DTYPE, device=DEVICE
-        )
         fn = lambda: torch_concat_mla_absorb_q(a, b, out)
     else:
         FN_MAP = {
             "aot": aot_concat_mla_absorb_q,
             "jit": jit_concat_mla_absorb_q,
         }
-        fn = lambda: FN_MAP[provider](a, b)
+        if provider == "jit":
+            # Use preallocated output for fair kernel-only comparison.
+            fn = lambda: FN_MAP[provider](a, b, out=out)
+        else:
+            fn = lambda: FN_MAP[provider](a, b)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = _run_bench(fn)
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
 if __name__ == "__main__":
+    if IS_HIP:
+        print(
+            "[bench_concat_mla] ROCm note: DeepSeek MHA runtime currently uses "
+            "`concat_and_cast_mha_k_triton` for K concat on HIP. "
+            "These numbers are kernel micro-benchmarks only."
+        )
+    if not HAS_AOT_CONCAT_MLA_K or not HAS_AOT_CONCAT_MLA_ABSORB_Q:
+        print(
+            "[bench_concat_mla] AOT ops missing in current sgl_kernel build; "
+            "running with available providers only."
+        )
     bench_concat_mla_k.run(print_data=True)
     bench_concat_mla_absorb_q.run(print_data=True)

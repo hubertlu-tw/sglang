@@ -5,6 +5,10 @@ import torch
 import triton
 
 
+def _has_sgl_kernel_op(op_name: str) -> bool:
+    return hasattr(torch.ops.sgl_kernel, op_name)
+
+
 def torch_concat_mla_k(
     k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor
 ) -> None:
@@ -109,6 +113,9 @@ def test_concat_mla_k_jit_vs_torch(num_tokens: int) -> None:
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
 def test_concat_mla_k_jit_vs_aot(num_tokens: int) -> None:
     """Test JIT kernel against AOT kernel for bitwise equivalence."""
+    if not _has_sgl_kernel_op("concat_mla_k"):
+        pytest.skip("sgl_kernel.concat_mla_k is not available in this environment")
+
     k_jit = torch.empty(
         num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE
     )
@@ -154,6 +161,11 @@ def test_concat_mla_absorb_q_jit_vs_torch(dim_0: int, dim_1: int) -> None:
 )
 def test_concat_mla_absorb_q_jit_vs_aot(dim_0: int, dim_1: int) -> None:
     """Test JIT kernel against AOT kernel for bitwise equivalence."""
+    if not _has_sgl_kernel_op("concat_mla_absorb_q"):
+        pytest.skip(
+            "sgl_kernel.concat_mla_absorb_q is not available in this environment"
+        )
+
     a = torch.randn(dim_0, dim_1, A_LAST_DIM, device=DEVICE, dtype=DTYPE)
     b = torch.randn(dim_0, dim_1, B_LAST_DIM, device=DEVICE, dtype=DTYPE)
     out_jit = torch.empty(dim_0, dim_1, OUT_LAST_DIM, device=DEVICE, dtype=DTYPE)
