@@ -113,9 +113,7 @@ class SuffixCacheAdapter:
             return
         self._cleanup_counter = 0
 
-        inactive_req_ids = [
-            rid for rid in self.req_state if rid not in active_req_ids
-        ]
+        inactive_req_ids = [rid for rid in self.req_state if rid not in active_req_ids]
         for rid in inactive_req_ids:
             cache_req_id, _ = self.req_state.pop(rid)
             if cache_req_id in getattr(self.suffix_cache, "active_requests", set()):
@@ -245,7 +243,9 @@ class SuffixCacheAdapter:
             draft_parents = list(draft.parents)
             draft_ids, draft_parents = self._reorder_tree_bfs(draft_ids, draft_parents)
 
-            context_token = output_ids[-1] if output_ids else (prompt[-1] if prompt else 0)
+            context_token = (
+                output_ids[-1] if output_ids else (prompt[-1] if prompt else 0)
+            )
             draft_ids, draft_parents = self._inject_root_node(
                 draft_ids, draft_parents, context_token
             )

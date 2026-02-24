@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.ngram_worker import NGRAMWorker, USE_FULL_MASK
+from sglang.srt.speculative.ngram_worker import USE_FULL_MASK, NGRAMWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.suffix_cache_adapter import SuffixCacheAdapter
 from sglang.srt.speculative.suffix_info import SuffixVerifyInput
@@ -155,9 +155,7 @@ class SuffixWorker(NGRAMWorker):
             for i, req in enumerate(batch.reqs):
                 seq_len = len(req.origin_input_ids) + len(req.output_ids)
                 width = (seq_len - 1) + self.draft_token_num
-                full_mask = np.ones(
-                    (self.draft_token_num, width), dtype=np.bool_
-                )
+                full_mask = np.ones((self.draft_token_num, width), dtype=np.bool_)
                 full_mask[:, seq_len - 1 :] = mask_reshaped[i]
                 parts.append(full_mask.ravel())
             tree_mask = torch.from_numpy(np.concatenate(parts)).to(

@@ -430,8 +430,7 @@ class NgramVerifyInput(SpecInput):
         # The --enable-speculative-sampling flag is reserved for future
         # use once those kernels are added to setup_rocm.py / common_extension_rocm.cc.
         is_all_greedy = (
-            sampling_info.is_all_greedy
-            or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
+            sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
         if is_hip() and not is_all_greedy:
             if get_global_server_args().enable_speculative_sampling:

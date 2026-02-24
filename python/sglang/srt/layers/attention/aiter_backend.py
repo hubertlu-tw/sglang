@@ -49,7 +49,9 @@ try:
         mla_prefill_ps_asm_fwd,
     )
 except ImportError:
-    logging.warning("Aiter: get_ps_metadata_info_v1, get_ps_metadata_v1, mla_prefill_ps_asm_fwd not found")
+    logging.warning(
+        "Aiter: get_ps_metadata_info_v1, get_ps_metadata_v1, mla_prefill_ps_asm_fwd not found"
+    )
     get_ps_metadata_info_v1 = None
     get_ps_metadata_v1 = None
     mla_prefill_ps_asm_fwd = None
@@ -1887,20 +1889,12 @@ class AiterAttnBackend(AttentionBackend):
 
                 # Note: KV cache save already happened at the top of forward_extend
                 self.extend_attention_fwd(
-                    q.contiguous().view(
-                        -1, layer.tp_q_head_num, layer.qk_head_dim
-                    ),
-                    k.contiguous().view(
-                        -1, layer.tp_k_head_num, layer.qk_head_dim
-                    ),
-                    v.contiguous().view(
-                        -1, layer.tp_v_head_num, layer.v_head_dim
-                    ),
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(
-                        layer.layer_id
-                    ),
+                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,

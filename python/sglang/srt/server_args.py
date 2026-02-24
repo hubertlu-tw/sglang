@@ -494,7 +494,7 @@ class ServerArgs:
     speculative_suffix_max_cached_requests: int = 10000
     speculative_suffix_max_spec_factor: float = 1.0
     speculative_suffix_min_token_prob: float = 0.1
-    
+
     # Sampling for suffix/ngram on AMD
     enable_speculative_sampling: bool = False
     enable_multi_layer_eagle: bool = False
@@ -4230,7 +4230,7 @@ class ServerArgs:
             help="Enable sampling-based verification for speculative decoding on AMD GPUs. "
             "By default (False), it uses greedy verification which may ignore temperature settings.",
         )
-        
+
         # Multi-layer Eagle speculative decoding
         parser.add_argument(
             "--enable-multi-layer-eagle",

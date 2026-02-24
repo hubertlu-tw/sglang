@@ -11,7 +11,7 @@ Includes:
 
 import os
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -32,14 +32,21 @@ GSM_DATASET_PATH = None
 # Default server arguments shared across all tests
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
-    "--tp", "8",
+    "--tp",
+    "8",
     "--enable-metrics",
-    "--model-loader-extra-config", '{"enable_multithread_load": true, "num_threads": 8}',
-    "--speculative-algorithm", "SUFFIX",
-    "--speculative-num-draft-tokens", "4",
-    "--speculative-suffix-max-spec-factor", "2.0",
-    "--speculative-suffix-min-token-prob", "0.2",
-    "--mem-fraction-static", "0.8",
+    "--model-loader-extra-config",
+    '{"enable_multithread_load": true, "num_threads": 8}',
+    "--speculative-algorithm",
+    "SUFFIX",
+    "--speculative-num-draft-tokens",
+    "4",
+    "--speculative-suffix-max-spec-factor",
+    "2.0",
+    "--speculative-suffix-min-token-prob",
+    "0.2",
+    "--mem-fraction-static",
+    "0.8",
 ]
 
 # AMD env vars for the integration tests
