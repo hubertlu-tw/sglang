@@ -62,10 +62,6 @@ ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
 
-ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
-ARG FHT_BRANCH="rocm"
-ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
-
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
@@ -293,14 +289,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
   "$VENV_PY" -c "import tilelang; print(tilelang.__version__)"'
-
-# -----------------------
-# Hadamard-transform (HIP build)
-RUN /bin/bash -lc 'set -euo pipefail; \
-    git clone --branch "${FHT_BRANCH}" "${FHT_REPO}" fast-hadamard-transform; \
-    cd fast-hadamard-transform; \
-    git checkout -f "${FHT_COMMIT}"; \
-    python setup.py install'
 
 # -----------------------
 # Python tools
