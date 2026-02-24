@@ -6,10 +6,15 @@
 
 #pragma once
 
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#endif
 
-#define FULL_MASK 0xffffffff
+#define FULL_MASK 0xffffffffu
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -72,7 +77,7 @@ struct Allreduce {
   template <typename T, typename Operator>
   static __device__ inline T run(T x, Operator& op) {
     constexpr int OFFSET = THREADS / 2;
-    x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
+    x = op(x, SGL_SHFL_XOR_SYNC(FULL_MASK, x, OFFSET, THREADS));
     return Allreduce<OFFSET>::run(x, op);
   }
 };
@@ -81,7 +86,7 @@ template <>
 struct Allreduce<2> {
   template <typename T, typename Operator>
   static __device__ inline T run(T x, Operator& op) {
-    x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
+    x = op(x, SGL_SHFL_XOR_SYNC(FULL_MASK, x, 1, 2));
     return x;
   }
 };
@@ -128,7 +133,7 @@ __device__ __forceinline__ void hadamard_mult_warp(float x[kNChunks][kNItems]) {
     for (int c = 0; c < kNChunks; ++c) {
 #pragma unroll
       for (int i = 0; i < kNItems; ++i) {
-        float x_val_other = __shfl_xor_sync(FULL_MASK, x[c][i], lane_mask);
+        float x_val_other = SGL_SHFL_XOR_SYNC(FULL_MASK, x[c][i], lane_mask, N);
         x[c][i] = sign * x[c][i] + x_val_other;
       }
     }
@@ -144,7 +149,16 @@ inline __device__ void load_input(input_t* x, float x_vals[kNChunks][kNElts], in
 #pragma unroll
   for (int c = 0; c < kNChunks; ++c) {
     if ((c * blockDim.x + threadIdx.x) * kNElts < dim) {
+#ifdef USE_ROCM
+      vec_t v = reinterpret_cast<const vec_t*>(x)[c * blockDim.x + threadIdx.x];
+      const input_t* vp = reinterpret_cast<const input_t*>(&v);
+#pragma unroll
+      for (int i = 0; i < kNElts; ++i) {
+        x_vals_load[c][i] = vp[i];
+      }
+#else
       reinterpret_cast<vec_t*>(x_vals_load)[c] = reinterpret_cast<const vec_t*>(x)[c * blockDim.x + threadIdx.x];
+#endif
     }
   }
 #pragma unroll
@@ -170,7 +184,17 @@ inline __device__ void store_output(output_t* out, float out_vals[kNChunks][kNEl
 #pragma unroll
   for (int c = 0; c < kNChunks; ++c) {
     if ((c * blockDim.x + threadIdx.x) * kNElts < dim) {
+#ifdef USE_ROCM
+      vec_t v;
+      output_t* vp = reinterpret_cast<output_t*>(&v);
+#pragma unroll
+      for (int i = 0; i < kNElts; ++i) {
+        vp[i] = out_vals_store[c][i];
+      }
+      reinterpret_cast<vec_t*>(out)[c * blockDim.x + threadIdx.x] = v;
+#else
       reinterpret_cast<vec_t*>(out)[c * blockDim.x + threadIdx.x] = reinterpret_cast<const vec_t*>(out_vals_store)[c];
+#endif
     }
   }
 }
@@ -182,6 +206,7 @@ template <int kNChunks, int kChunksPerExchange, int kNElts, int kWarpSize, int k
 inline __device__ void exchange_smem_pre(float x_vals[kNChunks][kNElts], vec_t* smem) {
   constexpr int kNThreads = kWarpSize * kNWarps;
   constexpr int kNExchangePerVec = kNElts / (sizeof(vec_t) / sizeof(float));
+  constexpr int kVecElts = sizeof(vec_t) / sizeof(float);
   const int warp_id = threadIdx.x / kWarpSize;
   const int lane_id = threadIdx.x % kWarpSize;
   const int row_t = threadIdx.x % kNWarps;
@@ -194,10 +219,22 @@ inline __device__ void exchange_smem_pre(float x_vals[kNChunks][kNElts], vec_t* 
     for (int c1 = 0; c1 < kChunksPerExchange; ++c1) {
 #pragma unroll
       for (int r = 0; r < kNExchangePerVec; ++r) {
+#ifdef USE_ROCM
+        vec_t tmp;
+        float* tp = reinterpret_cast<float*>(&tmp);
+#pragma unroll
+        for (int i = 0; i < kVecElts; ++i) {
+          tp[i] = x_vals[c0 * kChunksPerExchange + c1][r * kVecElts + i];
+        }
+        smem
+            [(c1 * kNExchangePerVec + r) * kNThreads +
+             (Pre ? warp_id * kWarpSize + lane_id ^ warp_id : row_t * kWarpSize + col_t ^ row_t)] = tmp;
+#else
         smem
             [(c1 * kNExchangePerVec + r) * kNThreads +
              (Pre ? warp_id * kWarpSize + lane_id ^ warp_id : row_t * kWarpSize + col_t ^ row_t)] =
                 reinterpret_cast<vec_t*>(x_vals[c0 * kChunksPerExchange + c1])[r];
+#endif
       }
     }
     __syncthreads();
@@ -205,9 +242,20 @@ inline __device__ void exchange_smem_pre(float x_vals[kNChunks][kNElts], vec_t* 
     for (int c1 = 0; c1 < kChunksPerExchange; ++c1) {
 #pragma unroll
       for (int r = 0; r < kNExchangePerVec; ++r) {
+#ifdef USE_ROCM
+        const vec_t tmp = smem
+            [(c1 * kNExchangePerVec + r) * kNThreads +
+             (Pre ? row_t * kWarpSize + col_t ^ row_t : warp_id * kWarpSize + lane_id ^ warp_id)];
+        const float* tp = reinterpret_cast<const float*>(&tmp);
+#pragma unroll
+        for (int i = 0; i < kVecElts; ++i) {
+          x_vals[c0 * kChunksPerExchange + c1][r * kVecElts + i] = tp[i];
+        }
+#else
         reinterpret_cast<vec_t*>(x_vals[c0 * kChunksPerExchange + c1])[r] = smem
             [(c1 * kNExchangePerVec + r) * kNThreads +
              (Pre ? row_t * kWarpSize + col_t ^ row_t : warp_id * kWarpSize + lane_id ^ warp_id)];
+#endif
       }
     }
   }

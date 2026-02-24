@@ -68,6 +68,12 @@ using fp32x4_t = float4;
 #define SGLANG_LDG(arg) *(arg)
 #endif
 
+#ifndef USE_ROCM
+#define SGL_SHFL_XOR_SYNC(MASK, X, OFFSET, WIDTH) __shfl_xor_sync((MASK), (X), (OFFSET), (WIDTH))
+#else
+#define SGL_SHFL_XOR_SYNC(MASK, X, OFFSET, WIDTH) __shfl_xor((X), (OFFSET))
+#endif
+
 namespace device {
 
 #define SGL_DEVICE __forceinline__ __device__

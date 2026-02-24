@@ -202,7 +202,11 @@ inline void set_max_dynamic_smem() {
   constexpr int kSmemSize = Ktraits::kSmemSize;
   if constexpr (kSmemSize >= 48 * 1024) {
     auto kernel = &fast_hadamard_transform_kernel<Ktraits>;
+#ifdef USE_ROCM
+    host::RuntimeDeviceCheck(hipFuncSetAttribute(kernel, hipFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+#else
     host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+#endif
   }
 }
 
@@ -406,7 +410,7 @@ inline void run_hadamard(const tvm::ffi::TensorView x, const tvm::ffi::TensorVie
   auto SX = SymbolicSize{"x_batch_stride"};
   auto SO = SymbolicSize{"out_batch_stride"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLCUDA, kDLROCM>();
 
   TensorMatcher({N, D}).with_strides({SX, 1}).with_dtype<DType>().with_device(device).verify(x);
   TensorMatcher({N, D}).with_strides({SO, 1}).with_dtype<DType>().with_device(device).verify(out);
