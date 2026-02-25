@@ -97,7 +97,6 @@ Suffix decoding adds a **speculate → verify** loop around the normal autoregre
 The result of each iteration is **1–N accepted tokens** per request (vs. exactly 1 in normal decode).
 **Trade-off: Each step is longer than normal Decode (more tokens through the model), but produces more (1-N) tokens, so wall-clock time per token is lower when the acceptance rate is high.**
 
-
 ---
 
 ## AMD-Specific Notes
@@ -120,38 +119,6 @@ Optimizations to reduce Python-side overhead compared to the base PR:
 - **O(n) BFS ancestor propagation** (`suffix_cache_adapter.py`): Tree masks built in one forward pass over BFS-ordered nodes instead of nested while-loops.
 - **No-copy output_ids** (`suffix_worker.py`, `suffix_cache_adapter.py`): Prompt and output tokens passed separately to avoid list concatenation per request per step.
 - **Throttled cleanup** (`suffix_cache_adapter.py`): Inactive-request pruning runs every 8 calls instead of every step.
-
----
-
-## Changed and New Files
-
-Below is the complete list of files modified or added by the suffix decoding feature branch.
-
-### New Files
-
-| File | Description |
-|---|---|
-| `python/sglang/srt/speculative/suffix_worker.py` | Suffix decoding worker (extends NGRAMWorker). Overrides draft token preparation and mask construction with optimized numpy-based implementations. All verification logic is inherited from NGRAMWorker. |
-| `python/sglang/srt/speculative/suffix_info.py` | Data structures for suffix decoding verification (extends NgramVerifyInput). Adds SUFFIX_VERIFY spec input type and debug logging of accepted tokens. |
-| `python/sglang/srt/speculative/suffix_cache_adapter.py` | Adapter wrapping `arctic_inference.SuffixDecodingCache` to match the NgramCache interface. Handles BFS reordering, root injection, and tree mask construction. |
-| `docs/advanced_features/suffix_decoding.md` | This documentation file. |
-| `test/registered/spec/test_suffix_speculative_decoding.py` | Test suite adapted from [PR #13553](https://github.com/sgl-project/sglang/pull/13553). Config validation, algorithm registration, `SuffixVerifyInput` unit tests, and GSM8K integration tests for fa3/triton/flashinfer backends. |
-
-### Modified Files
-
-| File | Changes |
-|---|---|
-| `python/sglang/srt/speculative/spec_info.py` | Added `SUFFIX` to `SpeculativeAlgorithm` enum, `SUFFIX_VERIFY` to `SpecInputType`, `is_suffix()` method, and `SuffixWorker` factory in `create_worker()`. |
-| `python/sglang/srt/speculative/spec_utils.py` | Updated comment: sampling kernel not compiled for HIP/ROCm yet. |
-| `python/sglang/srt/speculative/ngram_info.py` | Added AMD/ROCm fallback: forces greedy verification when sampling kernels are unavailable. Added warning when `--enable-speculative-sampling` is set on AMD. |
-| `python/sglang/srt/managers/scheduler.py` | Added `spec_algorithm.is_suffix()` check so suffix decoding skips draft KV pool allocation (like NGRAM). |
-| `python/sglang/srt/server_args.py` | Added suffix-specific CLI args (`--speculative-suffix-max-tree-depth`, `--speculative-suffix-max-cached-requests`, `--speculative-suffix-max-spec-factor`, `--speculative-suffix-min-token-prob`, `--enable-speculative-sampling`). Added SUFFIX validation logic. |
-| `python/sglang/srt/model_executor/cuda_graph_runner.py` | Added `is_suffix()` checks for CUDA graph capture and replay, mirroring the existing NGRAM path. |
-| `python/sglang/srt/layers/attention/aiter_backend.py` | Added non-MLA speculative decoding support for AMD: custom mask / mask_indptr fields in ForwardMetadata, direct metadata computation for DRAFT_EXTEND and TARGET_VERIFY modes, CUDA graph capture path for non-MLA tree verification. |
-| `python/sglang/srt/utils/common.py` | Added `is_arctic_inference_available()` utility function. |
-| `sgl-kernel/csrc/common_extension_rocm.cc` | Registered `verify_tree_greedy` kernel for the ROCm build. |
-| `sgl-kernel/setup_rocm.py` | Added `common_extension_rocm.cc` to the ROCm build sources. |
-| `python/pyproject.toml` | Added `arctic-inference` as optional dependency (`pip install "sglang[suffix-decoding]"`). |
 
 ---
 
