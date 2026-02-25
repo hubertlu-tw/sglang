@@ -12,25 +12,13 @@ For more details, see the [Suffix Decoding paper (arXiv:2411.04975)](https://arx
 
 ## Installation
 
-### 1. Stash Local Changes & Switch to the Suffix Decoding Branch
+Install the suffix decoding dependency:
 
 ```bash
-cd /sgl-workspace/sglang
-git stash
-git remote add amd-fork https://github.com/amd-pedghazi/sglang.git
-git fetch amd-fork feat/suffix-decoding-amd
-git checkout amd-fork/feat/suffix-decoding-amd
+pip install "sglang[suffix-decoding]"
 ```
 
-### 2. Install sgl-kernel (ROCm)
-
-```bash
-cd /sgl-workspace/sglang/sgl-kernel
-pip uninstall sgl-kernel
-python setup_rocm.py install
-```
-
-### 3. Install Python Dependencies
+Or manually:
 
 ```bash
 pip install arctic-inference==0.1.1
@@ -122,7 +110,7 @@ Changes made to enable suffix decoding on AMD:
 
 - **Non-MLA attention backend** (`aiter_backend.py`): Speculative decoding support for the AMD attention path — custom mask handling, metadata computation for draft-extend and target-verify modes, and CUDA graph capture for non-MLA tree verification.
 - **Greedy-only verification** (`ngram_info.py`): Forces greedy verification on ROCm because the sampling kernels are not compiled for HIP. Temperature / top-p / top-k are ignored during verification on AMD.
-- **ROCm kernel registration** (`common_extension_rocm.cc`, `setup_rocm.py`): Registered `verify_tree_greedy` in the ROCm build of sgl-kernel.
+- **ROCm kernel registration** (`common_extension_rocm.cc`): Registered `reconstruct_indices_from_tree_mask` in the ROCm build of sgl-kernel.
 
 ### Performance Optimizations
 
@@ -163,6 +151,7 @@ Below is the complete list of files modified or added by the suffix decoding fea
 | `python/sglang/srt/utils/common.py` | Added `is_arctic_inference_available()` utility function. |
 | `sgl-kernel/csrc/common_extension_rocm.cc` | Registered `verify_tree_greedy` kernel for the ROCm build. |
 | `sgl-kernel/setup_rocm.py` | Added `common_extension_rocm.cc` to the ROCm build sources. |
+| `python/pyproject.toml` | Added `arctic-inference` as optional dependency (`pip install "sglang[suffix-decoding]"`). |
 
 ---
 
@@ -221,5 +210,4 @@ curl http://127.0.0.1:30000/server_info | python -m json.tool | grep spec_accept
 ## References
 
 - [Suffix Decoding Paper (arXiv:2411.04975)](https://arxiv.org/abs/2411.04975)
-- [vLLM Suffix Decoding PR #25784](https://github.com/vllm-project/vllm/pull/25784)
 - [SGLang Suffix Decoding PR #13553](https://github.com/sgl-project/sglang/pull/13553)

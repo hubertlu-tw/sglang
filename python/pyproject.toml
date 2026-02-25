@@ -99,6 +99,7 @@ torch = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+suffix-decoding = ["arctic-inference==0.1.1"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",
