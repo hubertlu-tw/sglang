@@ -504,7 +504,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init auxiliary variables for triton attention backend."""
+        """Init auxiliary variables for aiter attention backend."""
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
@@ -618,7 +618,7 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indptr,
                     None,
                     kv_indices,
-                    self.req_to_token.size(1),
+                    self.req_to_token.stride(0),
                 )
 
                 if _use_mla_ps_kernel:
@@ -1136,13 +1136,14 @@ class AiterAttnBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
+                kv_lens = seq_lens + self.num_draft_tokens
                 kv_indptr = self.kv_indptr[: bs + 1]
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
                 kv_indices = self.cuda_graph_kv_indices
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     req_pool_indices,
-                    seq_lens,
+                    kv_lens,
                     kv_indptr,
                     None,
                     kv_indices,
