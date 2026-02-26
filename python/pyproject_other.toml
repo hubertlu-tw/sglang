@@ -16,6 +16,8 @@ classifiers = [
 dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
 
 [project.optional-dependencies]
+suffix-decoding = ["arctic-inference==0.1.1"]
+
 runtime_common = [
   "IPython",
   "aiohttp",
