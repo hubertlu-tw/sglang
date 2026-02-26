@@ -77,6 +77,21 @@ ARG AINIC_VERSION=1.117.5
 ARG UBUNTU_CODENAME=jammy
 USER root
 
+# To resolve marketing names for all supported AMD GPUs, install AMD's libdrm packages from repo.radeon.com.
+# Please refer to https://github.com/ROCm/ROCm/issues/5992 for more details.
+RUN curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+      | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
+    && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
+      > /etc/apt/sources.list.d/amdgpu-graphics.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         libdrm-amdgpu-common \
+         libdrm-amdgpu-amdgpu1 \
+         libdrm2-amdgpu \
+    && rm -rf /var/lib/apt/lists/* \
+    && cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids
+
+
 # Install some basic utilities
 RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
@@ -214,10 +229,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir maturin \
+RUN python3 -m pip install --no-cache-dir setuptools-rust \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && python3 -m pip install --force-reinstall dist/*.whl \
+    && /bin/bash -lc 'ulimit -n 8192 && cargo build --release' \
+    && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
 
 # -----------------------
@@ -280,7 +295,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   \
   # TVM Python bits need Cython + z3 before configure.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
+  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi>=0.1.6" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
   git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
@@ -390,7 +405,10 @@ ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
-ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
+ENV VLLM_FP8_PADDING=1
+ENV VLLM_FP8_ACT_PADDING=1
+ENV VLLM_FP8_WEIGHT_PADDING=1
+ENV VLLM_FP8_REDUCE_CONV=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
