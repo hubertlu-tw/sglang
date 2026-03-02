@@ -63,6 +63,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
+    set_rcclx_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -779,7 +780,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+        set_rcclx_all_reduce(self.server_args.enable_rcclx)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        if (
+            is_hip()
+            and self.server_args.enable_rcclx
+            and self.server_args.rcclx_so_path
+        ):
+            # Phase-1 RCCLX integration: route existing PyNccl path to RCCLX.
+            os.environ["SGLANG_NCCL_SO_PATH"] = self.server_args.rcclx_so_path
+            # Phase-2 communicator also reads the dedicated env name if set.
+            os.environ["SGLANG_RCCLX_SO_PATH"] = self.server_args.rcclx_so_path
 
         if not self.is_draft_worker:
             if self.device == "cpu":

@@ -96,6 +96,9 @@ ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
+ARG ENABLE_RCCLX=0
+ARG TORCHCOMMS_REPO="https://github.com/meta-pytorch/torchcomms.git"
+ARG TORCHCOMMS_COMMIT=""
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 ARG MORI_COMMIT="2f88d06aba75400262ca5c1ca5986cf1fdf4cd82"
@@ -235,6 +238,31 @@ RUN git clone ${SGL_REPO} \
        else \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip]"; \
        fi
+
+# -----------------------
+# Optional: build torchcomms RCCLX for AMD ROCm.
+# This is disabled by default and only enabled when ENABLE_RCCLX=1.
+RUN if [ "$ENABLE_RCCLX" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends rsync \
+      && rm -rf /var/lib/apt/lists/* \
+      && cd /sgl-workspace \
+      && rm -rf torchcomms \
+      && git clone ${TORCHCOMMS_REPO} torchcomms \
+      && cd torchcomms \
+      && if [ -n "${TORCHCOMMS_COMMIT}" ]; then git checkout "${TORCHCOMMS_COMMIT}"; fi \
+      && export CONDA_PREFIX=/opt/venv \
+      && export CMAKE_PREFIX_PATH=/opt/venv \
+      && export ROCM_HOME=/opt/rocm \
+      && export BUILDDIR=/sgl-workspace/torchcomms/build/rcclx \
+      && export AMDGPU_TARGETS=${GPU_ARCH_LIST} \
+      && ./build_rcclx.sh \
+      && export RCCLX_INCLUDE=${BUILDDIR}/include/rccl \
+      && export RCCLX_LIB=${BUILDDIR}/lib \
+      && USE_TRANSPORT=OFF USE_NCCL=0 USE_NCCLX=0 USE_GLOO=0 USE_RCCL=0 USE_RCCLX=1 pip install --no-build-isolation -v . \
+      && echo "export RCCLX_INCLUDE=${BUILDDIR}/include/rccl" >> /etc/bash.bashrc \
+      && echo "export RCCLX_LIB=${BUILDDIR}/lib" >> /etc/bash.bashrc \
+      && echo "export LD_LIBRARY_PATH=${BUILDDIR}/lib:/opt/rocm/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc; \
+    fi
 
 RUN python -m pip cache purge
 
