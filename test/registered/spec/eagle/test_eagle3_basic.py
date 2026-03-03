@@ -56,7 +56,10 @@ class TestEagle3Basic(EagleServerBase):
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 2.24)
+        if _is_hip:
+            self.assertGreater(avg_spec_accept_length, 2.24)
+        else:
+            self.assertGreater(avg_spec_accept_length, 2.26)
 
 
 if __name__ == "__main__":
