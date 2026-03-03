@@ -976,7 +976,10 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            kv_lens = seq_lens + self.num_draft_tokens
+            if self.use_mla:
+                kv_lens = seq_lens + self.num_draft_tokens
+            else:
+                kv_lens = seq_lens
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
