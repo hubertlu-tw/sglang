@@ -502,6 +502,7 @@ class AiterAttnBackend(AttentionBackend):
                 "AiterAttnBackend SPEC_V2 path currently supports topk <= 1 only. "
                 f"Got topk={self.topk}."
             )
+
     def mla_fp8_prefill_attn(
         self,
         q: torch.Tensor,
