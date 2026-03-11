@@ -1211,14 +1211,6 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
             if self.use_mla:
-                qo_indptr = self.qo_indptr[: bs + 1]
-                qo_indptr[: bs + 1] = torch.arange(
-                    0,
-                    (1 + bs) * self.num_draft_tokens,
-                    step=self.num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
                 kv_lens = seq_lens + self.num_draft_tokens
             else:
                 kv_lens = seq_lens
