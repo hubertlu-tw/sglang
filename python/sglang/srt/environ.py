@@ -307,6 +307,7 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    SGLANG_AITER_FUSED_FP4_BMM_ROPE_CACHE_MLA = EnvBool(True)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
     # MPS (Apple Silicon)

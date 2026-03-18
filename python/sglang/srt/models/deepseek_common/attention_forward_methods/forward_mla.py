@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -24,7 +25,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -73,7 +76,15 @@ if _use_aiter_gfx95:
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
-    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+    from sglang.srt.layers.rocm_linear_utils import (
+        fused_fp4_bmm_rope_cat_and_cache_mla,
+        fused_qk_rope_cat_and_cache_mla,
+    )
+
+
+_use_aiter_fused_fp4_bmm_rope_cache_mla = get_bool_env_var(
+    "SGLANG_AITER_FUSED_FP4_BMM_ROPE_CACHE_MLA", "true"
+)
 
 
 class DeepseekMLAForwardMixin:
@@ -82,6 +93,7 @@ class DeepseekMLAForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
+        self._logged_fp4_fused_mla_path = False
 
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
@@ -94,6 +106,7 @@ class DeepseekMLAForwardMixin:
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         q_lora = None
+        q_nope_for_fp4_fused_mla = None
         topk_indices = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
@@ -211,6 +224,15 @@ class DeepseekMLAForwardMixin:
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
+        use_fused_fp4_bmm_rope_cache = (
+            _use_aiter_gfx95
+            and self.w_kc.dtype == torch.uint8
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+            and _use_aiter_fused_fp4_bmm_rope_cache_mla
+            and fused_fp4_bmm_rope_cat_and_cache_mla is not None
+        )
+
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -229,21 +251,25 @@ class DeepseekMLAForwardMixin:
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
-                x = q_nope.transpose(0, 1)
-                q_nope_out = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_kc.shape[2],
-                    device=x.device,
-                    dtype=torch.bfloat16,
-                )
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_kc.transpose(-2, -1),
-                    self.w_scale_k.transpose(-2, -1),
-                    torch.bfloat16,
-                    q_nope_out,
-                )
+                if use_fused_fp4_bmm_rope_cache:
+                    q_nope_for_fp4_fused_mla = q_nope.transpose(0, 1)
+                    q_nope_out = None
+                else:
+                    x = q_nope.transpose(0, 1)
+                    q_nope_out = torch.empty(
+                        x.shape[0],
+                        x.shape[1],
+                        self.w_kc.shape[2],
+                        device=x.device,
+                        dtype=torch.bfloat16,
+                    )
+                    batched_gemm_afp4wfp4_pre_quant(
+                        x,
+                        self.w_kc.transpose(-2, -1),
+                        self.w_scale_k.transpose(-2, -1),
+                        torch.bfloat16,
+                        q_nope_out,
+                    )
             else:
                 if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
                     get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
@@ -283,7 +309,8 @@ class DeepseekMLAForwardMixin:
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+        if q_nope_out is not None:
+            q_nope_out = q_nope_out.transpose(0, 1)
 
         if (
             self.rotary_emb is not None
@@ -302,6 +329,7 @@ class DeepseekMLAForwardMixin:
             q_pe,
             k_pe,
             q_nope_out,
+            q_nope_for_fp4_fused_mla,
             k_nope,
             forward_batch,
             zero_allocator,
@@ -315,6 +343,7 @@ class DeepseekMLAForwardMixin:
         q_pe,
         k_pe,
         q_nope_out,
+        q_nope_for_fp4_fused_mla,
         k_nope,
         forward_batch,
         zero_allocator,
@@ -349,25 +378,64 @@ class DeepseekMLAForwardMixin:
                 sin = self.rotary_emb.sin_cache
 
                 kv_cache_dtype = (
-                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+                    fp8_dtype
+                    if self.kv_cache_dtype == "fp8_e4m3"
+                    else (q_nope_out.dtype if q_nope_out is not None else q_pe.dtype)
                 )
-
-                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
-                    q_nope_out,
-                    q_pe,
-                    k_nope,
-                    k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
-                    forward_batch.out_cache_loc,
-                    positions,
-                    cos,
-                    sin,
-                    self.attn_mqa.k_scale,
-                    self.rotary_emb.is_neox_style,
-                    q_out_dtype=kv_cache_dtype,
+                use_fused_fp4_bmm_rope_cache = (
+                    q_nope_for_fp4_fused_mla is not None
+                    and _use_aiter_fused_fp4_bmm_rope_cache_mla
+                    and fused_fp4_bmm_rope_cat_and_cache_mla is not None
                 )
+                if use_fused_fp4_bmm_rope_cache:
+                    if not self._logged_fp4_fused_mla_path:
+                        logger.info(
+                            "Enable fused_fp4_bmm_rope_cat_and_cache_mla for ROCm MLA path."
+                        )
+                        self._logged_fp4_fused_mla_path = True
+                    q, _, _, k = fused_fp4_bmm_rope_cat_and_cache_mla(
+                        q_nope_for_fp4_fused_mla,
+                        self.w_kc.transpose(-2, -1),
+                        self.w_scale_k.transpose(-2, -1),
+                        q_pe,
+                        k_nope,
+                        k_pe,
+                        forward_batch.token_to_kv_pool.get_key_buffer(
+                            self.attn_mqa.layer_id
+                        ),
+                        forward_batch.out_cache_loc,
+                        positions,
+                        cos,
+                        sin,
+                        k_scale=self.attn_mqa.k_scale,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        q_out_dtype=(
+                            fp8_dtype
+                            if self.kv_cache_dtype == "fp8_e4m3"
+                            else q_pe.dtype
+                        ),
+                    )
+                else:
+                    assert q_nope_out is not None, (
+                        "q_nope_out must be available for fallback "
+                        "fused_qk_rope_cat_and_cache_mla path."
+                    )
+                    q, _, _, k = fused_qk_rope_cat_and_cache_mla(
+                        q_nope_out,
+                        q_pe,
+                        k_nope,
+                        k_pe,
+                        forward_batch.token_to_kv_pool.get_key_buffer(
+                            self.attn_mqa.layer_id
+                        ),
+                        forward_batch.out_cache_loc,
+                        positions,
+                        cos,
+                        sin,
+                        self.attn_mqa.k_scale,
+                        self.rotary_emb.is_neox_style,
+                        q_out_dtype=kv_cache_dtype,
+                    )
 
                 save_kv_cache = False
             else:

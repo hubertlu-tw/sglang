@@ -6,7 +6,19 @@ from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
 from sglang.srt.utils import BumpAllocator
 
-__all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
+try:
+    from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+        fused_fp4_bmm_rope_cat_and_cache_mla,
+    )
+except ImportError:
+    # Keep runtime compatible with older aiter wheels.
+    fused_fp4_bmm_rope_cat_and_cache_mla = None
+
+__all__ = [
+    "fused_qk_rope_cat",
+    "fused_qk_rope_cat_and_cache_mla",
+    "fused_fp4_bmm_rope_cat_and_cache_mla",
+]
 
 
 def aiter_dsv3_router_gemm(
