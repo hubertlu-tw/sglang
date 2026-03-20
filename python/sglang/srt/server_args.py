@@ -2333,7 +2333,14 @@ class ServerArgs:
             self.get_attention_backends()
         )
 
-        if is_cuda():
+        if is_cuda() or is_hip():
+            if is_hip():
+                device_name = get_device_name().lower()
+                if "gfx95" not in device_name and "mi355" not in device_name:
+                    raise RuntimeError(
+                        "KV4 on ROCm is only enabled on gfx95x GPUs (e.g., MI355X). "
+                        f"Got device: {device_name}."
+                    )
             if (
                 self.prefill_attention_backend_str != self.decode_attention_backend_str
                 and self.prefill_attention_backend_str != "fa4"
@@ -2378,6 +2385,7 @@ class ServerArgs:
                             "flashinfer",
                             "trtllm_mla",
                             "flashmla",
+                            "aiter",
                         ]
                         assert (
                             self.attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES
@@ -2399,7 +2407,9 @@ class ServerArgs:
                             f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
                         )
         else:
-            raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+            raise RuntimeError(
+                "KV4 is currently only enabled on CUDA and ROCm gfx95x platforms."
+            )
 
     def _handle_page_size(self):
         if self.page_size is None:

@@ -344,7 +344,11 @@ class DeepseekMLAForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if _use_aiter_gfx95:
+            # fused_qk_rope_cat_and_cache_mla writes directly to get_key_buffer().
+            # For FP4 KV, get_key_buffer() dequantizes the entire pool, and the
+            # kernel cannot write FP4-packed output.  Route to the unfused path
+            # which lets set_kv_buffer() handle FP4 quantization per-token.
+            if _use_aiter_gfx95 and self.kv_cache_dtype != "fp4_e2m1":
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -371,6 +375,16 @@ class DeepseekMLAForwardMixin:
 
                 save_kv_cache = False
             else:
+                # FP4 unfused path: rope was skipped at prepare() when
+                # _use_aiter and _is_gfx95_supported (it expects the fused
+                # kernel to apply it).  Apply it now.
+                if (
+                    self.rotary_emb is not None
+                    and _use_aiter
+                    and _is_gfx95_supported
+                    and not self.use_nsa
+                ):
+                    q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
 

@@ -31,6 +31,11 @@ class DeepseekMLARocmForwardMixin:
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
+        # The ROCm fused decode MLA Triton kernel expects bf16/fp8 KV layout
+        # and cannot consume FP4-packed tensors.  Disable it for FP4 KV cache
+        # so the standard aiter MLA decode path is used instead.
+        if self.kv_cache_dtype == "fp4_e2m1":
+            self.rocm_fused_decode_mla = False
 
     def forward_absorb_fused_mla_rope_prepare(
         self: DeepseekV2AttentionMLA,
