@@ -1139,7 +1139,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1154,7 +1153,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("in_proj_ba.", "in_proj_b.", 0),
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
-
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
