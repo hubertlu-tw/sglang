@@ -87,6 +87,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    num_token_non_padded: Optional[torch.Tensor] = None
 
 
 @contextmanager
@@ -197,6 +198,14 @@ class PiecewiseCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
+        if _is_hip and self._has_linear_attention_layers(model_runner):
+            max_t = max(self.capture_num_tokens) if self.capture_num_tokens else 512
+            small = [s for s in self.capture_num_tokens if s <= 512]
+            large = [min(1024, max_t)]
+            if max_t > 1024:
+                large.append(max_t)
+            large = [s for s in large if s > 512]
+            self.capture_num_tokens = sorted(set(small + large))
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
@@ -242,6 +251,7 @@ class PiecewiseCudaGraphRunner:
                 else None
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -272,6 +282,7 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
         )
         self.buffers.share_buffers()
 
@@ -336,6 +347,28 @@ class PiecewiseCudaGraphRunner:
                 self.capture()
 
         self.raw_num_tokens = 0
+
+    @staticmethod
+    def _has_linear_attention_layers(model_runner) -> bool:
+        """Check if the model has linear attention (GDN/Mamba) layers."""
+        model = model_runner.model
+        for attr_path in [
+            "layers",
+            "language_model.layers",
+            "language_model.model.layers",
+            "model.layers",
+        ]:
+            obj = model
+            for part in attr_path.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return any(
+                    hasattr(layer, "linear_attn") or hasattr(layer, "ssm")
+                    for layer in obj
+                )
+        return False
 
     _aiter_chip_info_cached = False
 
@@ -402,6 +435,7 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+        buffers.num_token_non_padded.fill_(num_tokens)
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -440,7 +474,7 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=buffers.num_token_non_padded,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
@@ -524,6 +558,17 @@ class PiecewiseCudaGraphRunner:
         buffers = self.buffers
         bs = 1
 
+        if hasattr(self.model_runner.req_to_token_pool, "mamba_pool"):
+            mamba_pool = self.model_runner.req_to_token_pool.mamba_pool
+            if mamba_pool is not None:
+                req_pool_idx = torch.arange(bs, device=self.device)
+                mamba_idx = self.model_runner.req_to_token_pool.get_mamba_indices(
+                    req_pool_idx
+                )
+                for conv in mamba_pool.mamba_cache.conv:
+                    conv[mamba_idx] = 0
+                mamba_pool.mamba_cache.temporal[mamba_idx] = 0
+
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
         input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
@@ -563,6 +608,7 @@ class PiecewiseCudaGraphRunner:
         else:
             lora_ids = None
 
+        buffers.num_token_non_padded.fill_(num_tokens)
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -601,7 +647,7 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=buffers.num_token_non_padded,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
@@ -644,10 +690,24 @@ class PiecewiseCudaGraphRunner:
 
         # run twice for warmup at the first time and cuda graph capture at the second time
         # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+        self.device_module.synchronize()
+        self.model_runner.tp_group.barrier()
+        run_once()
+
+        if hasattr(self.model_runner.req_to_token_pool, "mamba_pool"):
+            mamba_pool = self.model_runner.req_to_token_pool.mamba_pool
+            if mamba_pool is not None:
+                req_pool_idx = torch.arange(bs, device=self.device)
+                mamba_idx = self.model_runner.req_to_token_pool.get_mamba_indices(
+                    req_pool_idx
+                )
+                for conv in mamba_pool.mamba_cache.conv:
+                    conv[mamba_idx] = 0
+                mamba_pool.mamba_cache.temporal[mamba_idx] = 0
+
+        self.device_module.synchronize()
+        self.model_runner.tp_group.barrier()
+        run_once()
 
         return
 
@@ -661,6 +721,7 @@ class PiecewiseCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
+        buffers.num_token_non_padded.fill_(num_tokens)
         if static_num_tokens != num_tokens:
             buffers.out_cache_loc.zero_()
             if buffers.out_cache_loc_swa is not None:
@@ -791,7 +852,7 @@ class PiecewiseCudaGraphRunner:
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            num_token_non_padded=buffers.num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,

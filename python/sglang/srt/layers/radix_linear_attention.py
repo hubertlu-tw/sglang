@@ -22,7 +22,10 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -131,6 +134,26 @@ def unified_linear_attention_with_output(
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
+    ba_dim = getattr(attention_layer, "_pcg_ba_dim", 0) if _is_hip else 0
+    if ba_dim > 0:
+        nv = ba_dim // 2
+        ba_data = mixed_qkv[:, -ba_dim:].contiguous()
+        mixed_qkv = mixed_qkv[:, :-ba_dim].contiguous()
+        b = ba_data[:, :nv].contiguous()
+        a = ba_data[:, nv:].contiguous()
+
+    if _is_hip:
+        pcg_static_tokens = context.num_tokens
+        actual_tokens = context.raw_num_tokens
+        if (
+            pcg_static_tokens is not None
+            and actual_tokens is not None
+            and pcg_static_tokens > actual_tokens
+        ):
+            mixed_qkv = mixed_qkv[:actual_tokens].clone()
+            a = a[:actual_tokens].clone()
+            b = b[:actual_tokens].clone()
+
     ret = forward_batch.attn_backend.forward(
         layer=attention_layer,
         forward_batch=forward_batch,
@@ -146,4 +169,6 @@ def unified_linear_attention_with_output(
         token_to_kv_pool.set_swa_loc(original_swa_loc)
 
     output[:, :real_num_tokens].copy_(ret)
+    if _is_hip and real_num_tokens < output.shape[1]:
+        output[:, real_num_tokens:].zero_()
     return
