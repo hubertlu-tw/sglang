@@ -82,15 +82,133 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
 
 if _use_aiter:
     import aiter
-
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter import gemm_a8w8_blockscale as gemm_a8w8_blockscale
-    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter import gemm_a8w8_blockscale as _gemm_a8w8_blockscale_orig
+    from aiter import gemm_a8w8_bpreshuffle as _gemm_a8w8_bpreshuffle_orig
+    from aiter import get_hip_quant
     from aiter.ops.triton.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     )
 
-    aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    _aiter_per1x128_quant_orig = get_hip_quant(aiter.QuantType.per_1x128)
+
+    from sglang.srt.utils.common import direct_register_custom_op
+
+    def _aiter_per1x128_quant_impl(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _aiter_per1x128_quant_orig(x, quant_dtype=aiter.dtypes.fp8)
+
+    def _aiter_per1x128_quant_fake(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        M, K = x.shape
+        q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
+        s = torch.empty((M, (K + 127) // 128), dtype=torch.float32, device=x.device)
+        return q, s
+
+    direct_register_custom_op(
+        op_name="aiter_per1x128_quant_fp8",
+        op_func=_aiter_per1x128_quant_impl,
+        mutates_args=[],
+        fake_impl=_aiter_per1x128_quant_fake,
+    )
+
+    def aiter_per1x128_quant(x, **kwargs):
+        return torch.ops.sglang.aiter_per1x128_quant_fp8(x)
+
+    def _aiter_gemm_a8w8_blockscale_impl(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return _gemm_a8w8_blockscale_orig(
+            XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+        )
+
+    def _aiter_gemm_a8w8_blockscale_fake(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        M = XQ.shape[0]
+        N = WQ.shape[0]
+        return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+
+    direct_register_custom_op(
+        op_name="aiter_gemm_a8w8_blockscale",
+        op_func=_aiter_gemm_a8w8_blockscale_impl,
+        mutates_args=[],
+        fake_impl=_aiter_gemm_a8w8_blockscale_fake,
+    )
+
+    def gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16, **kwargs):
+        return torch.ops.sglang.aiter_gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale).to(
+            dtype
+        )
+
+    def _aiter_gemm_a8w8_bpreshuffle_impl(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return _gemm_a8w8_bpreshuffle_orig(
+            XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+        )
+
+    def _aiter_gemm_a8w8_bpreshuffle_fake(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        M = XQ.shape[0]
+        N = WQ.shape[0]
+        return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+
+    direct_register_custom_op(
+        op_name="aiter_gemm_a8w8_bpreshuffle",
+        op_func=_aiter_gemm_a8w8_bpreshuffle_impl,
+        mutates_args=[],
+        fake_impl=_aiter_gemm_a8w8_bpreshuffle_fake,
+    )
+
+    def gemm_a8w8_bpreshuffle(
+        XQ, WQ, x_scale, w_scale, bias=None, dtype=torch.bfloat16, **kwargs
+    ):
+        out = torch.ops.sglang.aiter_gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale).to(
+            dtype
+        )
+        if bias is not None:
+            out = out + bias
+        return out
+
+    _aiter_per_token_quant_hip_orig = aiter.per_token_quant_hip
+
+    def _aiter_per_token_quant_hip_impl(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _aiter_per_token_quant_hip_orig(x, quant_dtype=aiter.dtypes.fp8)
+
+    def _aiter_per_token_quant_hip_fake(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        M, K = x.shape
+        q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
+        s = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+        return q, s
+
+    direct_register_custom_op(
+        op_name="aiter_per_token_quant_hip_fp8",
+        op_func=_aiter_per_token_quant_hip_impl,
+        mutates_args=[],
+        fake_impl=_aiter_per_token_quant_hip_fake,
+    )
+
+    def aiter_per_token_quant_hip(x, **kwargs):
+        return torch.ops.sglang.aiter_per_token_quant_hip_fp8(x)
 
 
 if _is_cuda:
@@ -1647,8 +1765,8 @@ def apply_fp8_ptpc_linear(
         q_input, x_scale = input
         q_input = q_input.view(-1, q_input.shape[-1])
         output_shape = [*q_input.shape[:-1], weight.shape[0]]
-        output = aiter.gemm_a8w8_bpreshuffle(
-            q_input, weight, x_scale, weight_scale, None, torch.bfloat16
+        output = gemm_a8w8_bpreshuffle(
+            q_input, weight, x_scale, weight_scale, dtype=torch.bfloat16
         )
         if bias is not None:
             output = output + bias
@@ -1660,7 +1778,7 @@ def apply_fp8_ptpc_linear(
     # weight is transposed (K, N)
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
-    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+    q_input, x_scale = aiter_per_token_quant_hip(input_2d)
 
     per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
@@ -1669,8 +1787,8 @@ def apply_fp8_ptpc_linear(
         # weight is in (N, K)
         output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
+    output = gemm_a8w8_bpreshuffle(
+        q_input, weight, x_scale, weight_scale, dtype=input.dtype
     )
     if bias is not None:
         output = output + bias
