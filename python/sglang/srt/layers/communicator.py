@@ -76,6 +76,16 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
+
+
+def _is_in_pcg() -> bool:
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
+
+    return is_in_piecewise_cuda_graph()
+
+
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
@@ -513,9 +523,13 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_aiter_all_reduce_fusion(hidden_states)
-                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
-                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+                    not _is_in_pcg()
+                    and (
+                        apply_aiter_all_reduce_fusion(hidden_states)
+                        or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                    )
+                    and hasattr(self.input_layernorm, "forward_with_allreduce_fusion")
+                ):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
                             hidden_states, residual, use_attn_tp_group=True
@@ -708,6 +722,9 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        if _is_in_pcg():
+            return False
+
         if (
             is_dp_attention_enabled()
             and self._speculative_algo is not None
@@ -965,9 +982,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             handled = False
             if (
-                apply_aiter_all_reduce_fusion(hidden_states)
-                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
-            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+                not _is_in_pcg()
+                and (
+                    apply_aiter_all_reduce_fusion(hidden_states)
+                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                )
+                and hasattr(layernorm, "forward_with_allreduce_fusion")
+            ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual, use_attn_tp_group=True
                 )
