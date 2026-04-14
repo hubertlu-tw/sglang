@@ -169,6 +169,20 @@ def unified_attention_with_output(
     if _is_hip and not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
         attention_layer = attention_layer._pcg_mha_companion
 
+    if _is_hip:
+        pcg_static_tokens = context.num_tokens
+        actual_tokens = context.raw_num_tokens
+        if (
+            pcg_static_tokens is not None
+            and actual_tokens is not None
+            and pcg_static_tokens > actual_tokens
+        ):
+            query[actual_tokens:].zero_()
+            if key is not None:
+                key[actual_tokens:].zero_()
+            if value is not None:
+                value[actual_tokens:].zero_()
+
     kwargs = {}
     if q_rope is not None:
         kwargs["q_rope"] = q_rope[:real_num_tokens]

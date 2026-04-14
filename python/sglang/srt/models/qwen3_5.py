@@ -101,8 +101,8 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
-_is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_amx_available = cpu_has_amx_support()
 
@@ -452,6 +452,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
+            if _is_hip and forward_batch.forward_mode.is_extend():
+                from sglang.srt.compilation.piecewise_context_manager import (
+                    get_forward_context,
+                )
+
+                if get_forward_context() is not None:
+                    nv_tp = self.num_v_heads // self.attn_tp_size
+                    mixed_qkv = torch.cat((mixed_qkv, projected_states_ba), dim=-1)
+                    self.attn._pcg_ba_dim = nv_tp * 2
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
                 torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
