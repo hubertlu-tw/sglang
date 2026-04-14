@@ -23,7 +23,10 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -159,6 +162,13 @@ def unified_attention_with_output(
     key = key[:real_num_tokens]
     value = value[:real_num_tokens]
 
+    # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
+    # attn_mha) that share the same layer_id. The attention_layers list only
+    # stores attn_mqa. When the MHA path is active (save_kv_cache=False), use
+    # the companion attn_mha so the backend sees correct head/dim metadata.
+    if _is_hip and not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
+        attention_layer = attention_layer._pcg_mha_companion
+
     kwargs = {}
     if q_rope is not None:
         kwargs["q_rope"] = q_rope[:real_num_tokens]
@@ -196,4 +206,10 @@ def unified_attention_with_output(
         token_to_kv_pool.set_swa_loc(original_swa_loc)
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+    if _is_hip:
+        ret_numel = ret.numel()
+        total_numel = output.numel()
+        if ret_numel < total_numel:
+            output.view(-1)[ret_numel:].zero_()
     return
