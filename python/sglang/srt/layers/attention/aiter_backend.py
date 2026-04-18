@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
@@ -106,6 +107,97 @@ class ForwardMetadata:
 
 global_workspace_buffer = None
 
+
+@triton.jit
+def _scatter_ragged_to_page_table_kernel(
+    kv_flat_ptr,
+    kv_indptr_ptr,
+    dest_ptr,
+    dest_stride,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Scatter ragged flat kv_indices (token ids) into a 2D block-level page
+    table. Each output column is a block index (token_id // PAGE_SIZE);
+    per-request row length = ceil(kv_len / PAGE_SIZE).
+
+    We only write positions [0, num_blocks[req]). The downstream
+    `unified_attention` kernel bounds its reads by `seqused_k`, so stale
+    entries in the tail are never read and we can save ~30x HBM write
+    traffic vs. writing the full worst-case row width.
+    """
+    pid = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    start = tl.load(kv_indptr_ptr + pid).to(tl.int64)
+    kv_len = tl.load(kv_indptr_ptr + pid + 1).to(tl.int64) - start
+    num_blocks = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
+
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # Early exit for programs entirely past the active region. Cheap guard:
+    # cuts away tail programs whose whole tile is masked.
+    if block_id * BLOCK_SIZE >= num_blocks:
+        return
+    mask = offsets < num_blocks
+    token_idx = offsets.to(tl.int64) * PAGE_SIZE
+    vals = tl.load(kv_flat_ptr + start + token_idx, mask=mask, other=0)
+    block_vals = vals // PAGE_SIZE
+    tl.store(
+        dest_ptr + pid.to(tl.int64) * dest_stride + offsets,
+        block_vals,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _scatter_req_to_token_to_page_table_kernel(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    page_table_ptr,
+    req_to_token_stride,
+    page_table_stride,
+    DRAFT_NUM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Opt D scatter: directly read req_to_token[rp, 0..seq_lens+DRAFT_NUM)
+    at page-size stride and write block indices into the 2D page_table.
+
+    Avoids allocating an intermediate ragged (bs*max_context_len) int32
+    scratch buffer for EAGLE target_verify — which would be ~64 MB at
+    max_bs=128, context=128k. We only ever touch HBM at page-size stride.
+
+    One program covers BLOCK_SIZE blocks of one request.
+    """
+    pid = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    seq_len = tl.load(seq_lens_ptr + pid).to(tl.int64)
+    kv_len = seq_len + DRAFT_NUM
+    num_blocks = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
+
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if block_id * BLOCK_SIZE >= num_blocks:
+        return
+    mask = offsets < num_blocks
+
+    rp = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+    token_idx = offsets.to(tl.int64) * PAGE_SIZE  # first token of each block
+    # Load one token slot per block and divide by PAGE_SIZE to get block idx.
+    vals = tl.load(
+        req_to_token_ptr + rp * req_to_token_stride + token_idx,
+        mask=mask,
+        other=0,
+    )
+    block_vals = vals // PAGE_SIZE
+    tl.store(
+        page_table_ptr + pid.to(tl.int64) * page_table_stride + offsets,
+        block_vals,
+        mask=mask,
+    )
+
+
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
@@ -179,6 +271,14 @@ class AiterAttnBackend(AttentionBackend):
         self.qo_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
+        # Precomputed [0, 1, 2, ..., max_bs] used as qo_indptr in the
+        # unified-attn all-decode path (q_len == 1 per request). This avoids
+        # the per-step `cumsum(kv_last_page_len[:bs])` kernel launch, which
+        # in practice always evaluates to an arange because kv_last_page_len
+        # is constant-ones.
+        self.qo_indptr_unified_decode = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=model_runner.device
+        )
         self.mask_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
         )
@@ -207,6 +307,19 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
+
+        # Opt D: route EAGLE target_verify through unified_attention (instead of
+        # the slower triton extend_attention_fwd `_fwd_kernel`) when topk == 1,
+        # i.e. the draft chain is linear so the verify mask is pure causal.
+        # Measured hotspot: extend_attention_fwd at ~16% of target-graph kernel
+        # time at 1k context, scaling linearly with kv_len (dominant at 8k).
+        # Gated by env var so we can A/B cleanly.
+        self._use_unified_verify = (
+            self.use_triton_unified_attention
+            and not self.use_mla
+            and self.topk == 1
+            and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -485,6 +598,124 @@ class AiterAttnBackend(AttentionBackend):
         )
         return page_table[:, strided_indices] // page_size
 
+    def _build_unified_page_table_from_spec(
+        self,
+        spec_info,
+        bs: int,
+        dest_buf: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Convert flat ragged kv_indices (token-level) into a 2D block-level
+        page table using a Triton kernel. Output columns are block indices
+        (== token_id // page_size); per-request row length is
+        ceil(kv_len / page_size)."""
+        kv_indptr = spec_info.kv_indptr
+        kv_flat = spec_info.kv_indices
+        page_size = self.page_size
+        _capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        # The `unified_attention` kernel treats `max_seqlen_k =
+        # page_table.shape[1] * page_size` as a captured constant and reads
+        # block_table entries over the full row width regardless of
+        # `seqused_k`, so the page table must be padded to a fixed width that
+        # covers the worst-case context. Always size rows to the
+        # backend-level max_num_blocks_per_seq to match the non-spec path.
+        max_blocks = (self.max_context_len + page_size - 1) // page_size
+
+        if dest_buf is not None:
+            page_table = dest_buf
+            # NOTE: no explicit zero_() here. The scatter kernel below covers
+            # every column [0, max_blocks) for each of the bs rows via
+            # write_mask = offsets < max_blocks, and loads past num_blocks use
+            # other=0, so block_vals = 0//page_size = 0 is stored in the tail.
+            # Under CUDA-graph replay, bs is fixed to the captured value, so
+            # rows > bs (stale from earlier iterations) are never read by
+            # unified_attention (which only walks rows [0, bs)). A pre-zero of
+            # (bs, max_blocks) int32 is ~64KB*bs of redundant HBM writes per
+            # decode step and is the single biggest saving in this helper.
+        else:
+            # Eager / first-capture path: allocate zeroed so the subsequent
+            # scatter can rely on tail being 0 even if grid rounding skips a
+            # column. torch.zeros is cheap here because this branch only runs
+            # outside the hot replay loop.
+            page_table = torch.zeros(
+                bs, max_blocks, dtype=torch.int32, device=self.device
+            )
+
+        # Use a larger BLOCK_SIZE to reduce grid dimension — each program
+        # now covers BLOCK_SIZE page_table slots instead of 128, cutting
+        # kernel launch and per-program overhead by ~8x without touching
+        # HBM bandwidth (memory-bound kernel).
+        BLOCK_SIZE = 1024
+        grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
+        _scatter_ragged_to_page_table_kernel[grid](
+            kv_flat,
+            kv_indptr,
+            page_table,
+            page_table.stride(0),
+            PAGE_SIZE=page_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        return page_table
+
+    def _build_verify_unified_metadata(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        draft_num: int,
+        page_table_dest: Optional[torch.Tensor] = None,
+    ):
+        """Opt D helper: build 2D block page_table covering seq_lens + draft_num
+        and corresponding qo_indptr / seqused_k for `unified_attention` verify.
+
+        Assumes `set_kv_buffer` for the draft-token batch has already written
+        the new K/V into the unified cache at contiguous slots beyond seq_lens
+        for each request, so req_to_token[rp, :seq_lens[i]+draft_num] indexes
+        both prefix history AND the new draft tokens.
+
+        Scatters directly from req_to_token into the 2D page_table via a
+        dedicated Triton kernel — no intermediate ragged kv_indices, so no
+        extra HBM scratch (avoids bs*max_context_len scratch).
+
+        Returns (page_table_2d, qo_indptr, max_q_len=draft_num).
+        """
+        device = seq_lens.device
+        qo_indptr = self.qo_indptr[: bs + 1]
+        qo_indptr[: bs + 1] = torch.arange(
+            0,
+            (1 + bs) * draft_num,
+            step=draft_num,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        page_size = self.page_size
+        max_blocks = (self.max_context_len + page_size - 1) // page_size
+
+        if page_table_dest is not None:
+            page_table = page_table_dest
+        else:
+            # Eager path: allocate zeroed so tail blocks past kv_lens read as 0.
+            page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
+
+        BLOCK_SIZE = 1024
+        grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
+        _scatter_req_to_token_to_page_table_kernel[grid](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_table,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            DRAFT_NUM=draft_num,
+            PAGE_SIZE=page_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        return page_table, qo_indptr, draft_num
+
     def _resolve_v2_num_draft_tokens(
         self,
         extend_seq_lens: Optional[torch.Tensor] = None,
@@ -729,14 +960,20 @@ class AiterAttnBackend(AttentionBackend):
                     elif self.page_size > 1:
                         kv_indices = self._transform_table_1_to_real(kv_indices)
 
-                    qo_indptr = self.qo_indptr[: bs + 1]
-                    qo_indptr[1 : bs + 1] = torch.cumsum(
-                        self.kv_last_page_len[:bs], dim=0
-                    )
+                    # Decode is q_len==1 per request; qo_indptr == arange(0, bs+1).
+                    qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
             else:
-                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-                bs = kv_indptr.shape[0] - 1
+                if self.use_triton_unified_attention and not self.use_mla:
+                    bs = spec_info.kv_indptr.shape[0] - 1
+                    kv_indices = self._build_unified_page_table_from_spec(spec_info, bs)
+                    max_q_len = 1
+                    # Decode-path qo_indptr == arange(0, bs+1).
+                    qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
+                    kv_indptr = None
+                else:
+                    kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                    bs = kv_indptr.shape[0] - 1
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]
@@ -1038,51 +1275,74 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
-                # Non-MLA target_verify: use triton extend kernel with custom mask
+                # Non-MLA target_verify.
                 bs = len(forward_batch.req_pool_indices)
                 draft_num = spec_info.draft_token_num
 
-                qo_indptr = torch.arange(
-                    0,
-                    (1 + bs) * draft_num,
-                    step=draft_num,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
+                if self._use_unified_verify:
+                    # Opt D: route verify through unified_attention. topk==1 so
+                    # the draft chain is a linear sequence and the verify mask
+                    # is pure causal — no custom_mask needed.
+                    page_table, qo_indptr, max_q_len = (
+                        self._build_verify_unified_metadata(
+                            bs,
+                            forward_batch.seq_lens,
+                            forward_batch.req_pool_indices,
+                            draft_num,
+                        )
+                    )
+                    max_kv_len = page_table.shape[1] * self.page_size
+                    self.forward_metadata = ForwardMetadata(
+                        None,  # kv_indptr unused in unified-verify path
+                        page_table,  # 2D block page_table stored in kv_indices
+                        qo_indptr,
+                        None,
+                        max_q_len,
+                        max_kv_len,
+                        max_extend_len=max_q_len,
+                    )
+                else:
+                    qo_indptr = torch.arange(
+                        0,
+                        (1 + bs) * draft_num,
+                        step=draft_num,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
 
-                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
+                    kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
 
-                kv_indices = torch.empty(
-                    kv_indptr[-1], dtype=torch.int64, device=self.device
-                )
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
+                    kv_indices = torch.empty(
+                        kv_indptr[-1], dtype=torch.int64, device=self.device
+                    )
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
 
-                custom_mask = spec_info.custom_mask
-                seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
-                mask_indptr = self.mask_indptr
-                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-                mask_indptr = mask_indptr[: bs + 1]
+                    custom_mask = spec_info.custom_mask
+                    seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
+                    mask_indptr = self.mask_indptr
+                    mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                    mask_indptr = mask_indptr[: bs + 1]
 
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    None,
-                    draft_num,
-                    None,
-                    custom_mask=custom_mask,
-                    mask_indptr=mask_indptr,
-                    max_extend_len=draft_num,
-                )
+                    self.forward_metadata = ForwardMetadata(
+                        kv_indptr,
+                        kv_indices,
+                        qo_indptr,
+                        None,
+                        draft_num,
+                        None,
+                        custom_mask=custom_mask,
+                        mask_indptr=mask_indptr,
+                        max_extend_len=draft_num,
+                    )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -1281,7 +1541,12 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = None
             max_q_len = None
 
-            if spec_info is None:
+            if spec_info is None or (
+                self.use_triton_unified_attention and not self.use_mla
+            ):
+                max_num_blocks_per_seq = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
 
                 if not self.use_triton_unified_attention:
                     kv_indptr = self.kv_indptr
@@ -1299,43 +1564,45 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     max_q_len = 1
-                    max_num_blocks_per_seq = (
-                        self.max_context_len + self.page_size - 1
-                    ) // self.page_size
                     kv_indices = self.cuda_graph_kv_indices.view(
                         -1, max_num_blocks_per_seq
                     )
 
-                    page_indices = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
+                    if spec_info is not None:
+                        self._build_unified_page_table_from_spec(
+                            spec_info, bs, dest_buf=kv_indices
+                        )
+                    else:
+                        page_indices = self.req_to_token[
+                            req_pool_indices[:bs], :max_kv_len
+                        ]
 
-                    if self.use_sliding_window_kv_pool:
-                        swa_page_indices = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                page_indices
+                        if self.use_sliding_window_kv_pool:
+                            swa_page_indices = (
+                                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                    page_indices
+                                )
                             )
-                        )
 
-                        page_indices = self._transform_table_1_to_real(page_indices)
-                        swa_page_indices = self._transform_table_1_to_real(
-                            swa_page_indices
-                        )
+                            page_indices = self._transform_table_1_to_real(page_indices)
+                            swa_page_indices = self._transform_table_1_to_real(
+                                swa_page_indices
+                            )
 
-                        new_rows = swa_page_indices.shape[0]
-                        new_cols = swa_page_indices.shape[1]
+                            new_rows = swa_page_indices.shape[0]
+                            new_cols = swa_page_indices.shape[1]
 
-                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
-                        swa_page_table = self.cuda_graph_swa_page_table
-                        swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
-                    elif self.page_size > 1:
-                        page_indices = self._transform_table_1_to_real(page_indices)
-                        new_rows = page_indices.shape[0]
-                        new_cols = page_indices.shape[1]
-                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
+                            kv_indices[:new_rows, :new_cols].copy_(page_indices)
+                            swa_page_table = self.cuda_graph_swa_page_table
+                            swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                        elif self.page_size > 1:
+                            page_indices = self._transform_table_1_to_real(page_indices)
+                            new_rows = page_indices.shape[0]
+                            new_cols = page_indices.shape[1]
+                            kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
-                    qo_indptr = self.qo_indptr[: bs + 1]
-                    qo_indptr[1 : bs + 1] = torch.cumsum(
-                        self.cuda_graph_kv_last_page_len[:bs], dim=0
-                    )
+                    # Decode-path qo_indptr == arange(0, bs+1); precomputed.
+                    qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
                     kv_indptr = None
             else:
@@ -1466,24 +1733,55 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
-                custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-                seq_mask_len = max_q_len * (seq_lens + max_q_len)
-                mask_indptr = self.mask_indptr
-                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-                mask_indptr = mask_indptr[: bs + 1]
+                if self._use_unified_verify:
+                    # Opt D capture: view cuda_graph_kv_indices as 2D page_table
+                    # and populate directly from req_to_token.
+                    max_num_blocks_per_seq = (
+                        self.max_context_len + self.page_size - 1
+                    ) // self.page_size
+                    page_table = self.cuda_graph_kv_indices.view(
+                        -1, max_num_blocks_per_seq
+                    )[:bs]
+                    _page_table, _qo_indptr, _max_q_len = (
+                        self._build_verify_unified_metadata(
+                            bs,
+                            seq_lens,
+                            req_pool_indices,
+                            self.num_draft_tokens,
+                            page_table_dest=page_table,
+                        )
+                    )
+                    max_kv_len = max_num_blocks_per_seq * self.page_size
+                    self.forward_metadata = ForwardMetadata(
+                        None,
+                        _page_table,
+                        _qo_indptr,
+                        kv_last_page_len,
+                        _max_q_len,
+                        max_kv_len,
+                        max_extend_len=_max_q_len,
+                    )
+                else:
+                    custom_mask = self.cuda_graph_custom_mask
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
+                    seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                    mask_indptr = self.mask_indptr
+                    mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                    mask_indptr = mask_indptr[: bs + 1]
 
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    kv_last_page_len,
-                    max_q_len,
-                    max_kv_len,
-                    custom_mask=custom_mask,
-                    mask_indptr=mask_indptr,
-                    max_extend_len=max_q_len,
-                )
+                    self.forward_metadata = ForwardMetadata(
+                        kv_indptr,
+                        kv_indices,
+                        qo_indptr,
+                        kv_last_page_len,
+                        max_q_len,
+                        max_kv_len,
+                        custom_mask=custom_mask,
+                        mask_indptr=mask_indptr,
+                        max_extend_len=max_q_len,
+                    )
         elif forward_mode.is_draft_extend_v2():
             # EAGLE V2: Uses fixed num_draft_tokens per batch
             self._ensure_spec_v2_topk_supported()
@@ -1664,7 +1962,13 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = None
             max_q_len = None
 
-            if spec_info is None:
+            if spec_info is None or (
+                self.use_triton_unified_attention and not self.use_mla
+            ):
+                max_num_blocks_per_seq = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+
                 if not self.use_triton_unified_attention:
                     kv_indptr = self.kv_indptr
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
@@ -1681,43 +1985,45 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     max_q_len = 1
-                    max_num_blocks_per_seq = (
-                        self.max_context_len + self.page_size - 1
-                    ) // self.page_size
                     kv_indices = self.cuda_graph_kv_indices.view(
                         -1, max_num_blocks_per_seq
                     )
 
-                    page_indices = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
+                    if spec_info is not None:
+                        self._build_unified_page_table_from_spec(
+                            spec_info, bs, dest_buf=kv_indices
+                        )
+                    else:
+                        page_indices = self.req_to_token[
+                            req_pool_indices[:bs], :max_kv_len
+                        ]
 
-                    if self.use_sliding_window_kv_pool:
-                        swa_page_indices = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                page_indices
+                        if self.use_sliding_window_kv_pool:
+                            swa_page_indices = (
+                                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                    page_indices
+                                )
                             )
-                        )
 
-                        page_indices = self._transform_table_1_to_real(page_indices)
-                        swa_page_indices = self._transform_table_1_to_real(
-                            swa_page_indices
-                        )
+                            page_indices = self._transform_table_1_to_real(page_indices)
+                            swa_page_indices = self._transform_table_1_to_real(
+                                swa_page_indices
+                            )
 
-                        new_rows = swa_page_indices.shape[0]
-                        new_cols = swa_page_indices.shape[1]
+                            new_rows = swa_page_indices.shape[0]
+                            new_cols = swa_page_indices.shape[1]
 
-                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
-                        swa_page_table = self.cuda_graph_swa_page_table
-                        swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
-                    elif self.page_size > 1:
-                        page_indices = self._transform_table_1_to_real(page_indices)
-                        new_rows = page_indices.shape[0]
-                        new_cols = page_indices.shape[1]
-                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
+                            kv_indices[:new_rows, :new_cols].copy_(page_indices)
+                            swa_page_table = self.cuda_graph_swa_page_table
+                            swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                        elif self.page_size > 1:
+                            page_indices = self._transform_table_1_to_real(page_indices)
+                            new_rows = page_indices.shape[0]
+                            new_cols = page_indices.shape[1]
+                            kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
-                    qo_indptr = self.qo_indptr[: bs + 1]
-                    qo_indptr[1 : bs + 1] = torch.cumsum(
-                        self.cuda_graph_kv_last_page_len[:bs], dim=0
-                    )
+                    # Decode-path qo_indptr == arange(0, bs+1); precomputed.
+                    qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
                     kv_indptr = None
             else:
@@ -1850,23 +2156,55 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
-                custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-                seq_mask_len = max_q_len * (seq_lens + max_q_len)
-                mask_indptr = self.mask_indptr[: bs + 1]
-                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+                if self._use_unified_verify:
+                    # Opt D replay: repopulate the 2D page_table view into the
+                    # preallocated cuda_graph_kv_indices buffer. Static shapes
+                    # match what capture recorded.
+                    max_num_blocks_per_seq = (
+                        self.max_context_len + self.page_size - 1
+                    ) // self.page_size
+                    page_table = self.cuda_graph_kv_indices.view(
+                        -1, max_num_blocks_per_seq
+                    )[:bs]
+                    _page_table, _qo_indptr, _max_q_len = (
+                        self._build_verify_unified_metadata(
+                            bs,
+                            seq_lens,
+                            req_pool_indices,
+                            self.num_draft_tokens,
+                            page_table_dest=page_table,
+                        )
+                    )
+                    max_kv_len_unified = max_num_blocks_per_seq * self.page_size
+                    self.forward_metadata = ForwardMetadata(
+                        None,
+                        _page_table,
+                        _qo_indptr,
+                        kv_last_page_len,
+                        _max_q_len,
+                        max_kv_len_unified,
+                        max_extend_len=_max_q_len,
+                    )
+                else:
+                    custom_mask = self.cuda_graph_custom_mask
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
+                    seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                    mask_indptr = self.mask_indptr[: bs + 1]
+                    mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
 
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    kv_last_page_len,
-                    max_q_len,
-                    max_kv_len,
-                    custom_mask=custom_mask,
-                    mask_indptr=mask_indptr,
-                    max_extend_len=max_q_len,
-                )
+                    self.forward_metadata = ForwardMetadata(
+                        kv_indptr,
+                        kv_indices,
+                        qo_indptr,
+                        kv_last_page_len,
+                        max_q_len,
+                        max_kv_len,
+                        custom_mask=custom_mask,
+                        mask_indptr=mask_indptr,
+                        max_extend_len=max_q_len,
+                    )
         elif forward_mode.is_draft_extend_v2():
             # EAGLE V2: Fixed num_draft_tokens per batch
             self._ensure_spec_v2_topk_supported()
@@ -2333,13 +2671,60 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend()
             ):
-                # Use triton extend kernel which supports custom masks and causal masking
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                     )
                 else:
                     o = torch.empty_like(q)
+
+                # Opt D: route target_verify through unified_attention when
+                # topk==1 (draft chain linear -> pure causal mask, no custom
+                # mask needed). This swaps the Triton extend_attention_fwd
+                # kernel (~16% of target kernel time at 1k ctx, linear in kv
+                # len -> dominant at 8k) for unified_attention, which shares
+                # a more optimized 2D block-table kernel path with decode.
+                # draft_extend still uses the legacy path because topk>1
+                # branching is needed there.
+                if (
+                    self._use_unified_verify
+                    and forward_batch.forward_mode.is_target_verify()
+                ):
+                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    page_table = self.forward_metadata.kv_indices  # 2D
+                    max_kv_len = page_table.shape[1] * self.page_size
+                    # seqused_k add must stay INSIDE the captured graph region
+                    # (here, inside forward_extend). A host-side pre-add that
+                    # allocates a fresh tensor per replay invalidates the graph-
+                    # captured pointer → HSA memory-access fault during replay.
+                    # The per-layer redundant add is cheap on the GPU critical
+                    # path (~microseconds per verify) and CUDA-graph correct.
+                    unified_attention(
+                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k=k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v=v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        out=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        cu_seqlens_q=self.forward_metadata.qo_indptr,
+                        seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
+                        max_seqlen_q=self.forward_metadata.max_q_len,
+                        max_seqlen_k=max_kv_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        window_size=(-1, -1),
+                        block_table=page_table,
+                        softcap=layer.logit_cap,
+                        q_descale=None,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        sinks=sinks,
+                    )
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

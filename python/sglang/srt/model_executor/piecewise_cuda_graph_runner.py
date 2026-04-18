@@ -347,6 +347,7 @@ class PiecewiseCudaGraphRunner:
                 self.capture()
 
         self.raw_num_tokens = 0
+        self.static_num_tokens = 0
 
     @staticmethod
     def _has_linear_attention_layers(model_runner) -> bool:
@@ -721,6 +722,7 @@ class PiecewiseCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
+        self.static_num_tokens = static_num_tokens
         buffers.num_token_non_padded.fill_(num_tokens)
         if static_num_tokens != num_tokens:
             buffers.out_cache_loc.zero_()
@@ -884,8 +886,8 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
-                num_tokens=static_num_tokens,
-                raw_num_tokens=num_tokens,
+                num_tokens=self.static_num_tokens,
+                raw_num_tokens=self.raw_num_tokens,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)

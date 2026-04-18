@@ -54,6 +54,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if quant_config and quant_config.get_name() == "modelopt_fp4":
             quant_config = None
 
+        # Quark-quantized Qwen3.5 checkpoints (e.g. MXFP4) keep the MTP/draft
+        # weights in bf16 even when the routed experts are MXFP4; the entire
+        # `mtp.*` namespace is listed under `exclude` in quantization_config.
+        # If so, skip quantization for this module so linear/MoE weight
+        # loaders allocate bf16 shapes (upstream tracking: sgl issue #23113).
+        if quant_config and quant_config.get_name() == "quark":
+            exclude_layers = getattr(quant_config, "exclude_layers", [])
+            if any(
+                isinstance(layer, str) and layer.startswith("mtp.")
+                for layer in exclude_layers
+            ):
+                quant_config = None
+
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
