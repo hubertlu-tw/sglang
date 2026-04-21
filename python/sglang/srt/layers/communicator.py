@@ -442,6 +442,13 @@ class LayerCommunicator:
         # if the fused quant kernel returns ``None``.
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        # ``enable_fused_ar_quant_mlp=True`` extends the same fused path to
+        # ``prepare_mlp`` (post_attention_layernorm site). The MoE block
+        # consumes the resulting ``(bf16, fp8, scale)`` 3-tuple so that the
+        # gate / shared_expert_gate / topk read bf16 while ``self.experts``
+        # and ``self.shared_expert`` consume ``(fp8, scale)`` and skip their
+        # internal per-group quant. AMD/aiter-only.
+        enable_fused_ar_quant_mlp: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -451,6 +458,7 @@ class LayerCommunicator:
         self.qkv_latent_func = qkv_latent_func
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.enable_fused_ar_quant_mlp = enable_fused_ar_quant_mlp
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -704,6 +712,37 @@ class LayerCommunicator:
     ):
         if cache is not None:
             self._context.cache = cache
+
+        # AMD/aiter + FP8: try fused AR+RMSNorm+per-group-quant at the MoE
+        # input site, returning a ``(bf16, fp8, scale)`` 3-tuple. Gated on
+        # the same conditions under which ``_gather_hidden_states_and_residual``
+        # dispatches to ``forward_with_allreduce_fusion`` (non-DP, non-
+        # scattered-input, aiter AR-fusion eligible), plus MoE-specific
+        # gates: no moe_cp context-parallel extend, no DeepEP a2a (both
+        # permute tokens and a 3-tuple reshape is a follow-up).
+        if (
+            self.enable_fused_ar_quant_mlp
+            and _use_aiter
+            and isinstance(hidden_states, torch.Tensor)
+            and residual is not None
+            and hidden_states.shape[0] != 0
+            and apply_aiter_all_reduce_fusion(hidden_states)
+            and not get_attn_tp_context().input_scattered
+            and self._context.attn_dp_size == 1
+            and not (
+                get_moe_cp_size() > 1
+                and forward_batch.forward_mode.is_context_parallel_extend()
+            )
+            and not get_moe_a2a_backend().is_deepep()
+        ):
+            quant_result = self.post_attention_layernorm.forward_with_allreduce_fusion_quant_per_group(
+                hidden_states,
+                residual,
+                use_attn_tp_group=True,
+                keep_bf16=True,
+            )
+            if quant_result is not None:
+                return quant_result
 
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,

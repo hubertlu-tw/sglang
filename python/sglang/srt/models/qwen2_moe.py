@@ -203,11 +203,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
         is_nextn: bool = False,
         support_shared_expert_fusion: bool = False,
+        # AMD/aiter + FP8 only: when True, ``forward`` accepts a
+        # ``(bf16, fp8, scale)`` 3-tuple produced by the fused
+        # AR+RMSNorm+per-group-quant path at ``prepare_mlp`` and forwards
+        # ``(fp8, scale)`` straight to ``self.experts`` so the FP8 MoE
+        # runner skips its internal pre-MoE activation quant. Other models
+        # / hardware / quant schemes leave this False and see no behavior
+        # change.
+        fused_ar_quant_input: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.fused_ar_quant_input = fused_ar_quant_input
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -443,6 +452,44 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
+        # AMD/aiter + FP8 fast path: ``hidden_states`` is a
+        # ``(bf16, fp8, scale)`` 3-tuple from ``prepare_mlp``'s fused
+        # AR+RMSNorm+per-group-quant kernel. Gate / topk read bf16;
+        # ``self.experts`` receives ``(fp8, scale)`` and the FP8 MoE
+        # runner skips its internal per-group activation quant. Gated
+        # strictly on the ctor flag so bf16 / mxfp4 MoE models (and all
+        # non-AMD hardware) skip this branch entirely.
+        if self.fused_ar_quant_input and isinstance(hidden_states, tuple):
+            ht_bf16, ht_fp8, ht_scale = hidden_states
+            num_tokens, hidden_dim = ht_bf16.shape
+            router_logits, _ = self.gate(ht_bf16.view(-1, hidden_dim))
+            topk_output = self.topk(ht_bf16.view(-1, hidden_dim), router_logits)
+            if (
+                self.enable_shared_expert_fusion
+                and TopKOutputChecker.format_is_standard(topk_output)
+            ):
+                topk_output = self._append_shared_to_topk_output(
+                    topk_output, ht_bf16.view(-1, hidden_dim)
+                )
+            final_hidden_states = self.experts(
+                hidden_states=(
+                    ht_fp8.view(-1, ht_fp8.shape[-1]),
+                    ht_scale.view(-1, ht_scale.shape[-1]),
+                ),
+                topk_output=topk_output,
+            )
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+                and not should_use_dp_reduce_scatterv()
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+            return final_hidden_states.view(num_tokens, hidden_dim)
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -107,10 +107,18 @@ class StandardDispatcher(BaseDispatcher):
         self.local_expert_mapping = None
 
     def dispatch(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_output: TopKOutput,
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # AMD-only: pre-quantized ``(fp8, scale)`` 2-tuple input unpacks
+        # into the ``(hidden_states, hidden_states_scale)`` pair. Plain
+        # tensor input (DeepSeek-V2/V3, Mixtral, Qwen2-MoE, Qwen3-MoE, …)
+        # falls through to the FP4 / default branches unchanged.
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        elif should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states
             if (
                 fp4_quantize_flashinfer is None

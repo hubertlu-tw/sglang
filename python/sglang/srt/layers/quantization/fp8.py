@@ -1573,6 +1573,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 dispatch_output.topk_output,
                 moe_runner_config.activation,
                 moe_runner_config.no_combine,
+                # AMD-only: pre-quantized activation scale from a fused
+                # AR+RMSNorm+per-group-quant upstream step. When non-None,
+                # ``x`` is already FP8 and the aiter ``fused_moe`` reads
+                # ``a1_scale`` directly, skipping its internal quant.
+                a1_scale=getattr(dispatch_output, "hidden_states_scale", None),
             )
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
@@ -1766,6 +1771,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         topk_output: TopKOutput,
         activation: str = "silu",
         no_combine: bool = False,
+        a1_scale: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         topk_weights, topk_ids, _ = topk_output
         if _use_hip_int4:
@@ -1788,6 +1794,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
+                # When ``a1_scale`` is supplied the activation ``x`` is
+                # already FP8 (pre-quantized by the fused AR+RMSNorm+PG-
+                # quant upstream step). aiter's ``partial_transpose`` uses
+                # ``input.size(0)`` as a fallback when ``num_rows`` is not
+                # provided, which is graph-capture-safe. Also pass
+                # ``dtype=bf16`` explicitly since the default dtype is
+                # inferred from the fp8 activation dtype.
+                fused_moe_kwargs = {"a1_scale": a1_scale}
+                if a1_scale is not None:
+                    fused_moe_kwargs["dtype"] = torch.bfloat16
                 return fused_moe(
                     x,
                     layer.w13_weight,
@@ -1803,6 +1819,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         else ActivationType.Gelu
                     ),
                     expert_mask=layer.expert_mask_gpu,
+                    **fused_moe_kwargs,
                 )
             else:
                 return fused_moe(

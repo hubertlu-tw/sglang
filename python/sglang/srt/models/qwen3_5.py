@@ -134,6 +134,22 @@ def _enable_qwen35_fused_ar_quant() -> bool:
     return bool(get_global_server_args().enable_aiter_allreduce_fusion)
 
 
+@lru_cache(maxsize=1)
+def _enable_qwen35_fused_ar_quant_mlp() -> bool:
+    """Gate the ``prepare_mlp`` extension of the fused AR+RMSNorm+PG-quant path.
+
+    Inherits all gates from ``_enable_qwen35_fused_ar_quant`` and adds an
+    opt-out ``SGLANG_DISABLE_FUSED_AR_QUANT_MLP=1`` env var for A/B testing
+    this specific optimization without also disabling the established
+    ``prepare_attn`` fusion.
+    """
+    if not _enable_qwen35_fused_ar_quant():
+        return False
+    if get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT_MLP", default="false"):
+        return False
+    return True
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -599,6 +615,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
+                fused_ar_quant_input=_enable_qwen35_fused_ar_quant_mlp(),
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -634,6 +651,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # fused AR+RMSNorm+per-group-quant path with keep_bf16=True so we
         # produce both outputs from a single normalization without having
         # to dequantize.
+        # When the layer is a sparse MoE block, also enable the fused
+        # AR+RMSNorm+per-group-quant path at ``prepare_mlp`` so the MoE
+        # input skips its pre-experts activation quant (AMD/aiter-only).
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -642,6 +662,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=_enable_qwen35_fused_ar_quant(),
             fused_ar_quant_keep_bf16=True,
+            enable_fused_ar_quant_mlp=(
+                is_layer_sparse and _enable_qwen35_fused_ar_quant_mlp()
+            ),
         )
 
     def forward(
@@ -818,6 +841,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
+                fused_ar_quant_input=_enable_qwen35_fused_ar_quant_mlp(),
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -845,6 +869,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # normed output, so keep_bf16=False: the fully-fused
         # AR+RMSNorm+per-group-quant kernel replaces the 3-kernel baseline
         # (AR, RMSNorm, per-group-quant) with a single kernel when eligible.
+        # When the layer is a sparse MoE block, also enable the fused
+        # AR+RMSNorm+per-group-quant path at ``prepare_mlp``.
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -853,6 +879,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=_enable_qwen35_fused_ar_quant(),
             fused_ar_quant_keep_bf16=False,
+            enable_fused_ar_quant_mlp=(
+                is_layer_sparse and _enable_qwen35_fused_ar_quant_mlp()
+            ),
         )
 
         self.alt_stream = alt_stream

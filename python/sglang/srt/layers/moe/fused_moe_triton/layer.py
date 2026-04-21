@@ -3,7 +3,7 @@
 import logging
 from enum import Enum
 from functools import cached_property
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -975,7 +975,19 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(
+        self,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_output: TopKOutput,
+    ):
+        # AMD-only: pre-quantized ``(fp8, scale)`` 2-tuple input skips the
+        # internal per-group activation quant. Always route through
+        # ``forward_impl`` (the piecewise-cuda-graph wrappers below expect
+        # a plain tensor and are used only when the feature is off).
+        # Plain-tensor input (DeepSeek-V2/V3, Mixtral, Qwen2-MoE, …) falls
+        # through to the unchanged PCG / forward_impl dispatch below.
+        if isinstance(hidden_states, tuple):
+            return self.forward_impl(hidden_states, topk_output)
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1002,8 +1014,20 @@ class FusedMoE(torch.nn.Module):
         else:
             return self.forward_impl(hidden_states, topk_output)
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        origin_hidden_states_dim = hidden_states.shape[-1]
+    def forward_impl(
+        self,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_output: TopKOutput,
+    ):
+        # Accept either a plain tensor (default — DeepSeek-V2/V3, Mixtral,
+        # Qwen2-MoE, Qwen3-MoE, …) or a ``(fp8, scale)`` 2-tuple (AMD
+        # pre-quantized input path). ``origin_hidden_states_dim`` reads
+        # the logical hidden dim; for the fp8 tuple the fp8 tensor carries
+        # the dim directly (contiguous packing, no bit-packing).
+        if isinstance(hidden_states, tuple):
+            origin_hidden_states_dim = hidden_states[0].shape[-1]
+        else:
+            origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
         dispatch_output = self.dispatcher.dispatch(
