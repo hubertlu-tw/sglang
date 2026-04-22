@@ -103,6 +103,12 @@ class ForwardMetadata:
     max_extend_len: Optional[int] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     swa_page_table: Optional[torch.Tensor] = None
+    # Per-row used kv length for the draft-decode unified-attention path.
+    # forward_batch.seq_lens is the target's per-request prefix length and
+    # does not include draft tokens committed in earlier draft steps of the
+    # same round; passing it to unified_attention as seqused_k drops those
+    # tokens from the attention window and lowers accept length.
+    seqused_k: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -611,6 +617,7 @@ class AiterAttnBackend(AttentionBackend):
         bs: int,
         dest_buf: Optional[torch.Tensor] = None,
         swa_dest_buf: Optional[torch.Tensor] = None,
+        seqused_k_buf: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Convert ragged (token-level) kv_indices from spec_info into a 2D
         block-level page_table of shape (bs, max_num_blocks_per_seq).
@@ -646,6 +653,21 @@ class AiterAttnBackend(AttentionBackend):
                     bs, max_blocks, dtype=torch.int32, device=self.device
                 )
 
+        # Materialize per-row used kv length from the ragged indptr so that
+        # draft step i correctly attends to prefix + i tokens (the draft
+        # kv of earlier steps is already committed via set_kv_buffer).
+        if seqused_k_buf is not None:
+            # Static buffer path (cuda graph): in-place subtract so the
+            # captured graph references the same data pointer at replay.
+            torch.sub(
+                kv_indptr[1 : bs + 1],
+                kv_indptr[:bs],
+                out=seqused_k_buf[:bs],
+            )
+            seqused_k = seqused_k_buf[:bs]
+        else:
+            seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
         _scatter_ragged_to_page_table_kernel[grid](
@@ -660,7 +682,7 @@ class AiterAttnBackend(AttentionBackend):
             HAS_SWA=(swa_slot_mapping is not None),
         )
 
-        return page_table, swa_page_table
+        return page_table, swa_page_table, seqused_k
 
     def _build_verify_unified_metadata(
         self,
@@ -902,6 +924,7 @@ class AiterAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
+        spec_seqused_k = None  # set by unified-attention spec-info path
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
@@ -976,7 +999,7 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 if self.use_triton_unified_attention and not self.use_mla:
                     bs = spec_info.kv_indptr.shape[0] - 1
-                    kv_indices, swa_page_table = (
+                    kv_indices, swa_page_table, spec_seqused_k = (
                         self._build_unified_page_table_from_spec(spec_info, bs)
                     )
                     max_q_len = 1
@@ -1048,6 +1071,7 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 run_graph=False,
                 swa_page_table=swa_page_table,
+                seqused_k=spec_seqused_k,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -1530,6 +1554,12 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        # Static per-row seqused_k buffer for the spec-info unified-attention
+        # draft-decode path. Captured once so replay updates it in-place.
+        self.cuda_graph_spec_seqused_k = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -1542,6 +1572,7 @@ class AiterAttnBackend(AttentionBackend):
     ):
 
         num_kv_splits = None
+        spec_seqused_k = None  # set by unified-attention spec-info path
         # num_kv_splits_indptr = None
 
         work_metadata = None
@@ -1592,13 +1623,15 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table = self.cuda_graph_swa_page_table
 
                     if spec_info is not None:
-                        self._build_unified_page_table_from_spec(
+                        _, _, spec_seqused_k = self._build_unified_page_table_from_spec(
                             spec_info,
                             bs,
                             dest_buf=kv_indices,
                             swa_dest_buf=swa_page_table,
+                            seqused_k_buf=self.cuda_graph_spec_seqused_k,
                         )
                     else:
+                        spec_seqused_k = None
                         page_indices = self.req_to_token[
                             req_pool_indices[:bs], :max_kv_len
                         ]
@@ -1683,6 +1716,7 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
+                seqused_k=spec_seqused_k,
             )
 
         elif forward_mode.is_target_verify():
@@ -1975,6 +2009,7 @@ class AiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        spec_seqused_k = None  # set by unified-attention spec-info path
 
         num_kv_splits = None
         # num_kv_splits_indptr = None
@@ -2026,13 +2061,15 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table = self.cuda_graph_swa_page_table
 
                     if spec_info is not None:
-                        self._build_unified_page_table_from_spec(
+                        _, _, spec_seqused_k = self._build_unified_page_table_from_spec(
                             spec_info,
                             bs,
                             dest_buf=kv_indices,
                             swa_dest_buf=swa_page_table,
+                            seqused_k_buf=self.cuda_graph_spec_seqused_k,
                         )
                     else:
+                        spec_seqused_k = None
                         page_indices = self.req_to_token[
                             req_pool_indices[:bs], :max_kv_len
                         ]
@@ -2117,6 +2154,7 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
+                seqused_k=spec_seqused_k,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
@@ -2959,6 +2997,17 @@ class AiterAttnBackend(AttentionBackend):
 
                 max_kv_len = page_table.shape[1] * self.page_size
 
+                # For the EAGLE draft-decode path forward_batch.seq_lens only
+                # reflects the target's prefix length and omits the draft
+                # tokens committed in earlier steps of the same round. When the
+                # spec-info unified path is active we use the per-row kv length
+                # we already computed from spec_info.kv_indptr.
+                seqused_k = (
+                    self.forward_metadata.seqused_k
+                    if self.forward_metadata.seqused_k is not None
+                    else forward_batch.seq_lens
+                )
+
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
@@ -2969,7 +3018,7 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     out=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     cu_seqlens_q=self.forward_metadata.qo_indptr,
-                    seqused_k=forward_batch.seq_lens,
+                    seqused_k=seqused_k,
                     max_seqlen_q=self.forward_metadata.max_q_len,
                     max_seqlen_k=max_kv_len,
                     softmax_scale=self.scale,
