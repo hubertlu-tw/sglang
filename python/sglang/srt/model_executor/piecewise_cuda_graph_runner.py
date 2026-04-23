@@ -799,12 +799,19 @@ class PiecewiseCudaGraphRunner:
                 )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
-                        next_token_logits=output.next_token_logits[
-                            : self.raw_num_tokens
-                        ],
+                        next_token_logits=(
+                            output.next_token_logits[: self.raw_num_tokens]
+                            if output.next_token_logits is not None
+                            else None
+                        ),
                         hidden_states=(
                             output.hidden_states[: self.raw_num_tokens]
                             if output.hidden_states is not None
+                            else None
+                        ),
+                        next_token_ids_shortcut=(
+                            output.next_token_ids_shortcut[: self.raw_num_tokens]
+                            if output.next_token_ids_shortcut is not None
                             else None
                         ),
                     )
