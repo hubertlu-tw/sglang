@@ -88,6 +88,73 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
+
+def _is_gfx950_supported() -> bool:
+    if not (_use_aiter and _is_gfx95_supported):
+        return False
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+_enable_fused_ar_mxfp4_quant = _is_gfx950_supported()
+
+
+def _try_fused_allreduce_rmsnorm_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    layernorm: torch.nn.Module,
+    quant_format: str,
+):
+    """Try an AITER fused AR+RMSNorm+quant epilogue.
+
+    Returns None when unsupported so callers can use the existing
+    forward_with_allreduce_fusion fallback. New quant formats should plug in here
+    instead of adding branches inside LayerCommunicator.prepare_attn.
+    """
+    if not (_use_aiter and _is_gfx95_supported):
+        return None
+
+    if (
+        _enable_fused_ar_mxfp4_quant
+        and ("mxfp4" in quant_format)
+        and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT", "false")
+    ):
+        from sglang.srt.distributed.communication_op import (
+            tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant,
+        )
+
+        quant_result = tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
+            hidden_states,
+            residual,
+            layernorm.weight,
+            layernorm.variance_epsilon,
+            emit_bf16=True,
+        )
+        if quant_result is None:
+            return None
+
+        (
+            hidden_states_fp4,
+            residual,
+            hidden_states_scale,
+            normed_hidden_states,
+        ) = quant_result
+        return (
+            (
+                normed_hidden_states,
+                hidden_states_fp4,
+                hidden_states_scale,
+            ),
+            residual,
+        )
+
+    # Future hook: FP8 per-group fused AR+RMSNorm+quant can be added here and
+    # return the same (hidden_states, residual) contract.
+    return None
+
+
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
@@ -525,11 +592,20 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    hidden_states, residual = (
-                        self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=False
-                        )
+                    quant_result = _try_fused_allreduce_rmsnorm_quant(
+                        hidden_states,
+                        residual,
+                        self.input_layernorm,
+                        quant_format,
                     )
+                    if quant_result is not None:
+                        hidden_states, residual = quant_result
+                    else:
+                        hidden_states, residual = (
+                            self.input_layernorm.forward_with_allreduce_fusion(
+                                hidden_states, residual, use_attn_tp_group=False
+                            )
+                        )
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(

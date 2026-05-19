@@ -141,6 +141,15 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
+        hidden_states_for_indexer = hidden_states
+        if (
+            _is_hip
+            and _use_aiter_gfx95
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == 3
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
+        ):
+            hidden_states_for_indexer = hidden_states[0]
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
@@ -240,7 +249,7 @@ class DeepseekMLAForwardMixin:
                     )
                 if not self.skip_topk or prev_topk_indices is None:
                     topk_indices = self.indexer(
-                        x=hidden_states,
+                        x=hidden_states_for_indexer,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
@@ -259,7 +268,7 @@ class DeepseekMLAForwardMixin:
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
                         topk_indices = self.indexer(
-                            x=hidden_states,
+                            x=hidden_states_for_indexer,
                             q_lora=q_lora,
                             positions=positions,
                             forward_batch=forward_batch,

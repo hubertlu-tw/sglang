@@ -1742,6 +1742,15 @@ class DeepseekV2AttentionMLA(
         # bypass the adapter because it reads weight.T directly.
         lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
         if (
+            _is_hip
+            and _use_aiter_gfx95
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == 3
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
+        ):
+            _, hidden_states_fp4, hidden_states_scale = hidden_states
+            hidden_states = (hidden_states_fp4, hidden_states_scale)
+        if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16

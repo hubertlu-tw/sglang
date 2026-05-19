@@ -75,6 +75,16 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
+def _should_use_1stage_mxfp4_ar(input_: torch.Tensor) -> bool:
+    tokens, hidden_size = input_.shape
+    if hidden_size == 7168:
+        # CUDA-graph microbench: direct MXFP4 epilogue is faster through 56
+        # tokens, while fallback wins from 64 tokens onward.
+        return tokens <= 56
+    total_bytes = input_.numel() * input_.element_size()
+    return total_bytes <= 128 * 1024
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
@@ -694,6 +704,38 @@ class GroupCoordinator:
             use_1stage_ar,
         )
         return fused_outputs
+
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        emit_bf16: bool = False,
+    ):
+        """Attempt fused all-reduce + RMSNorm + MXFP4 quant via AITER custom AR."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_mxfp4_quant"):
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = _should_use_1stage_mxfp4_ar(input_)
+
+        try:
+            return ca_comm.custom_fused_ar_rms_mxfp4_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+            )
+        except Exception:
+            return None
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
