@@ -54,9 +54,7 @@ RUN python3 -c "import torch; print('torch', torch.__version__); assert torch.ve
 FROM rocm-torch AS sglang
 
 ARG GPU_ARCH=gfx1151
-# sgl-kernel's ROCm build (python/sglang/kernels/aot/setup_rocm.py) only accepts
-# gfx942/gfx950/gfx1250 and hard-exits on anything else; the patch below lifts
-# that gate. Set to 0 to skip the AOT kernels entirely and run Triton-only.
+# Set to 0 to skip the AOT kernels entirely and run Triton-only.
 ARG BUILD_SGL_KERNEL=1
 ARG MAX_JOBS=12
 
@@ -77,22 +75,10 @@ RUN cd /sgl-workspace/sglang \
     && rm -f python/pyproject.toml \
     && mv python/pyproject_other.toml python/pyproject.toml
 
-# One problem in setup_rocm.py for this target, plus one in include/utils.h:
-# the arch gate sys.exit(1)s outside {gfx942, gfx950, gfx1250}, and WARP_SIZE
-# resolves to 64 on the host pass but 32 on the device pass for a wave32 part,
-# which mismatches the MoE TopK launch bounds. Current main already limits
-# non-gfx942 TopK dynamic LDS to 40KB, which fits gfx1151's 64KB limit. The
-# remaining two problems are fixed here rather than upstream:
-# gfx1151 is not a supported SGLang target, and the sources themselves compile
-# clean for it. Each edit greps for the expected text first, so a rewrite
-# upstream breaks the build loudly instead of silently misconfiguring kernels.
-COPY docker/patches/sgl-kernel-gfx1151.sh /tmp/sgl-kernel-gfx1151.sh
-
 RUN cd /sgl-workspace/sglang/python/sglang/kernels/aot \
     && if [ "${BUILD_SGL_KERNEL}" = "1" ]; then \
          rm -f pyproject.toml \
          && mv pyproject_rocm.toml pyproject.toml \
-         && sh /tmp/sgl-kernel-gfx1151.sh setup_rocm.py \
          && AMDGPU_TARGET=${GPU_ARCH} MAX_JOBS=${MAX_JOBS} python3 setup_rocm.py install; \
        else \
          echo "Skipping sgl-kernel build (BUILD_SGL_KERNEL=0)"; \
@@ -151,6 +137,8 @@ RUN git clone --recursive ${AITER_REPO} /sgl-workspace/aiter \
 # This is load-bearing beyond attention: aiter's RMSNorm uses v_pk_mul_f32,
 # a CDNA-only instruction, and its CK attention templates assume wave64.
 ENV SGLANG_USE_AITER=0
+# AITER custom all-reduce is not supported on gfx1151. Use RCCL for multi-GPU.
+ENV SGLANG_USE_AITER_AR=0
 
 WORKDIR /sgl-workspace/sglang
 CMD ["/bin/bash"]

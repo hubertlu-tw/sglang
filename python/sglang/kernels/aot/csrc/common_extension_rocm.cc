@@ -69,6 +69,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
+#ifndef SGL_IS_RDNA
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
       "str[] handles, int[] offsets, int rank, "
@@ -128,6 +129,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
+#endif  // !SGL_IS_RDNA
 
   /*
    * From csrc/moe

@@ -41,9 +41,6 @@ include_dirs = [
 ]
 
 sources = [
-    "csrc/allreduce/custom_all_reduce.hip",
-    "csrc/allreduce/deterministic_all_reduce.hip",
-    "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
@@ -75,15 +72,18 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1151", "gfx1250"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        "Expected 'gfx942', 'gfx950', 'gfx1151', or 'gfx1250'."
     )
     sys.exit(1)
 
+is_gfx1151 = amdgpu_target == "gfx1151"
+
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)  # gfx950 and gfx1250 use E4M3
+)  # gfx950, gfx1151, and gfx1250 use E4M3
 
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
@@ -91,6 +91,16 @@ fp8_macro = (
 # - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
 #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
 topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
+
+# These all-reduce kernels rely on CDNA-style wave and peer-IPC behavior and
+# are not supported on gfx1151. Their declarations, registration, and Python
+# wrappers are guarded consistently below and in the corresponding sources.
+if not is_gfx1151:
+    sources += [
+        "csrc/allreduce/custom_all_reduce.hip",
+        "csrc/allreduce/deterministic_all_reduce.hip",
+        "csrc/allreduce/quick_all_reduce.cu",
+    ]
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -105,6 +115,14 @@ hipcc_flags = [
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
+
+if is_gfx1151:
+    # The build currently emits one architecture per wheel. Pinning wave32 in
+    # both compiler passes keeps host launch geometry and device launch bounds
+    # consistent without a process-wide runtime cache.
+    rocm_arch_flags = ["-DSGL_IS_RDNA", "-DSGL_ROCM_WARP_SIZE=32"]
+    hipcc_flags.extend(rocm_arch_flags)
+    cxx_flags.extend(rocm_arch_flags)
 
 ext_modules = [
     CUDAExtension(

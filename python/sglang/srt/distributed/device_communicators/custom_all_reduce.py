@@ -370,6 +370,10 @@ def dispatch_custom_allreduce(
 
     assert _is_hip
 
+    if not ops.IS_CUSTOM_AR_AVAILABLE:
+        logger.info("[AR] ROCm custom all-reduce is unavailable; falling back to RCCL")
+        return CustomAllreduce
+
     if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
             logger.debug(

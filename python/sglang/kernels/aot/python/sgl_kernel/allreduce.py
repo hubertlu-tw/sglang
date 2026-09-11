@@ -2,7 +2,18 @@ from typing import List, Optional, Tuple
 
 import torch
 
-if torch.version.hip is not None:
+
+def _has_custom_ar() -> bool:
+    """Return whether the loaded extension registered custom all-reduce."""
+    try:
+        return hasattr(torch.ops.sgl_kernel, "init_custom_ar")
+    except Exception:
+        return False
+
+
+_HAS_CUSTOM_AR = torch.version.hip is not None and _has_custom_ar()
+
+if _HAS_CUSTOM_AR:
     # ROCM custom allreduce
     def init_custom_ar(
         meta: torch.Tensor,
@@ -91,6 +102,11 @@ if torch.version.hip is not None:
 
     def qr_max_size() -> int:
         return torch.ops.sgl_kernel.qr_max_size.default()
+
+elif torch.version.hip is not None:
+    # gfx1151 omits the unsupported ROCm custom/deterministic/quick all-reduce
+    # kernels. Do not expose wrappers for operators that are not registered.
+    pass
 
 else:
 

@@ -19,6 +19,10 @@ IS_QUICK_AR_AVAILABLE = _is_hip
 
 try:
     import sgl_kernel.allreduce as _custom_ar
+
+    if _is_hip:
+        IS_CUSTOM_AR_AVAILABLE = hasattr(_custom_ar, "init_custom_ar")
+        IS_QUICK_AR_AVAILABLE = hasattr(_custom_ar, "init_custom_qr")
 except ImportError as e:
     if _is_cuda or _is_hip:
         logger.warning("Failed to import from custom_ar with %r", e)
