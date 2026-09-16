@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
 from typing import Optional
 
 import torch
@@ -125,6 +126,144 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit(do_not_specialize=["T"])
+def chunk_fwd_kernel_o_gfx1151_grouped_three_head(
+    q,
+    k,
+    v,
+    h,
+    g,
+    o,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_v, i_tg, i_hg = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_t = (
+        tl.load(chunk_indices + i_tg * 2).to(tl.int32),
+        tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int32),
+    )
+    bos, eos = (
+        tl.load(cu_seqlens + i_n).to(tl.int32),
+        tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+    )
+    T = eos - bos
+
+    # This kernel is dispatched only for Hg=16, H=48, and K=V=128.
+    q += (bos * 16 + i_hg) * 128
+    k += (bos * 16 + i_hg) * 128
+
+    # Compute the raw QK product once for the three value heads that share q/k.
+    b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    for i_k in range(tl.cdiv(128, BK)):
+        p_q = tl.make_block_ptr(
+            q, (T, 128), (16 * 128, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+        )
+        p_k = tl.make_block_ptr(
+            k, (128, T), (1, 16 * 128), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_A += tl.dot(b_q, b_k)
+
+    o_i = tl.arange(0, BT)
+    b_A = tl.where(o_i[:, None] >= o_i[None, :], b_A, 0.0)
+
+    # Keep one head-specific output accumulator live at a time.
+    for j in tl.static_range(3):
+        i_h = i_hg * 3 + j
+        b_o = tl.zeros([BT, BV], dtype=tl.float32)
+        for i_k in range(tl.cdiv(128, BK)):
+            p_q = tl.make_block_ptr(
+                q,
+                (T, 128),
+                (16 * 128, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            p_h = tl.make_block_ptr(
+                h + (i_tg * 48 + i_h).to(tl.int64) * 128 * 128,
+                (128, 128),
+                (128, 1),
+                (i_v * BV, i_k * BK),
+                (BV, BK),
+                (1, 0),
+            )
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_h = tl.load(p_h, boundary_check=(0, 1))
+            b_o += tl.dot(b_q, tl.trans(b_h))
+
+        p_g = tl.make_block_ptr(
+            g + bos * 48 + i_h,
+            (T,),
+            (48,),
+            (i_t * BT,),
+            (BT,),
+            (0,),
+        )
+        b_g = tl.load(p_g, boundary_check=(0,))
+        b_o *= exp(b_g)[:, None]
+        b_A_gated = b_A * safe_exp(b_g[:, None] - b_g[None, :])
+
+        p_v = tl.make_block_ptr(
+            v + (bos * 48 + i_h) * 128,
+            (T, 128),
+            (48 * 128, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_o = tl.make_block_ptr(
+            o + (bos * 48 + i_h) * 128,
+            (T, 128),
+            (48 * 128, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_o = b_o * scale + tl.dot(b_A_gated.to(b_v.dtype), b_v) * scale
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+@functools.cache
+def _is_gfx1151(device: torch.device) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    return arch.split(":", 1)[0].startswith("gfx1151")
+
+
+def _use_gfx1151_grouped_three_head(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    h: torch.Tensor,
+    g: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.LongTensor],
+    chunk_size: int,
+    total_chunks: int,
+) -> bool:
+    return (
+        _is_gfx1151(q.device)
+        and chunk_size == 64
+        and cu_seqlens is not None
+        and g is not None
+        and q.dtype == k.dtype == v.dtype == h.dtype == torch.bfloat16
+        and q.shape[0] == 1
+        and q.shape[2:] == (16, 128)
+        and k.shape == q.shape
+        and v.shape == (1, q.shape[1], 48, 128)
+        and g.shape == (1, q.shape[1], 48)
+        and h.shape == (1, total_chunks, 48, 128, 128)
+    )
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -134,6 +273,7 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
+    use_gfx1151_grouped_three_head: Optional[bool] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -147,30 +287,57 @@ def chunk_fwd_o(
 
     o = torch.zeros_like(v)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
-
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=128,
-        BV=64,
-        USE_G=g is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+    can_use_grouped = _use_gfx1151_grouped_three_head(
+        q, k, v, h, g, cu_seqlens, chunk_size, NT
     )
+    use_grouped = can_use_grouped and use_gfx1151_grouped_three_head is not False
+    if use_gfx1151_grouped_three_head is True and not can_use_grouped:
+        raise ValueError("grouped-three-head chunk_fwd_o specialization is not eligible")
+
+    if use_grouped:
+        chunk_fwd_kernel_o_gfx1151_grouped_three_head[(2, NT, 16)](
+            q,
+            k,
+            v,
+            h,
+            g,
+            o,
+            cu_seqlens,
+            chunk_indices,
+            scale,
+            T=T,
+            BT=BT,
+            BK=64,
+            BV=64,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]), NT, B * H)
+
+        chunk_fwd_kernel_o[grid](
+            q,
+            k,
+            v,
+            h,
+            g,
+            o,
+            cu_seqlens,
+            chunk_indices,
+            scale,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=128,
+            BV=64,
+            USE_G=g is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=4,
+            num_stages=2,
+        )
     return o
