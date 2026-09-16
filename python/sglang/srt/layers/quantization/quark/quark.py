@@ -21,8 +21,8 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
     QuarkMoEScheme,
     QuarkW4A4MXFP4,
-    QuarkW4A16Int4,
     QuarkW4A4MXFp4MoE,
+    QuarkW4A16Int4,
     QuarkW4A8MXFp4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
@@ -715,36 +715,20 @@ class QuarkConfig(QuantizationConfig):
         weight_quant: Optional[dict[str, Any]],
         input_quant: Optional[dict[str, Any]],
     ) -> bool:
-        # Weight-only: activations stay in their original precision.
+        # Weight-only quantization keeps activations in fp16/bf16.
         if weight_quant is None or input_quant is not None:
             return False
-
         if weight_quant.get("dtype") != "int4":
-            logger.debug("Quark model is not in int4 W4A16 format: dtype not int4")
             return False
-
         if weight_quant.get("qscheme") != "per_group":
-            logger.debug("Quark model is not in int4 W4A16 format: not per_group")
             return False
-
-        # The AWQ packing the kernels expect is 8 int4 per int32 along the
-        # output dim, with one scale per `group_size` inputs.
-        from sglang.kernels.ops.quantization.awq_triton import (
-            AWQ_TRITON_SUPPORTED_GROUP_SIZES,
-        )
-
-        if weight_quant.get("group_size") not in AWQ_TRITON_SUPPORTED_GROUP_SIZES:
+        if weight_quant.get("group_size") not in (32, 64, 128):
             logger.debug(
-                "Quark model is not in int4 W4A16 format: unsupported group_size %s",
+                "Quark INT4 W4A16 has unsupported group_size %s",
                 weight_quant.get("group_size"),
             )
             return False
-
-        if weight_quant.get("is_dynamic") is True:
-            logger.debug("Quark model is not in int4 W4A16 format: not weight static")
-            return False
-
-        return True
+        return weight_quant.get("is_dynamic") is not True
 
     def _is_mx_fp4(
         self,

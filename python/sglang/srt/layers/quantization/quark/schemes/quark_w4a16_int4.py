@@ -11,47 +11,26 @@ from sglang.srt.utils import is_hip
 
 __all__ = ["QuarkW4A16Int4"]
 
-# Per-nibble +8 (mod 16), i.e. signed int4 -> unsigned int4 with a +8 bias.
-_INT4_SIGN_FLIP = -2004318072  # 0x88888888 as a signed int32
-
-# Rows up to which the fused int4 GEMM beats dequantize-to-bf16 + hipBLAS GEMM.
-# Measured on gfx1151 (5120x17408): ~2.9x at M<=16, 1.13x at M=256, and it
-# falls behind from M~2048 (prefill), where the dense GEMM is compute-bound.
-_FUSED_GEMM_MAX_ROWS = 256
-
 
 class QuarkW4A16Int4(QuarkLinearScheme):
-    """Weight-only int4 per-group (W4A16), as produced by Quark's AWQ exporter.
+    """Quark weight-only INT4 using hybrid ROCm skinny/Triton GEMMs."""
 
-    The checkpoint layout is AWQ's: 8 int4 values packed per int32 along the
-    output dim, in AWQ's interleaved nibble order, with a bf16 per-group scale.
-    The only difference is that Quark stores *signed* int4 codes against an
-    all-zero zero-point, where AWQ stores unsigned codes against a zero-point
-    of 8. Since dequantization is ``(w - zp) * scale`` in both, adding 8 to
-    every nibble of both tensors is lossless and lets us reuse the AWQ kernels.
-    """
+    _SKINNY_MAX_BATCH_SIZE = 5
+    _SKINNY_LDS_ELEMENTS = 64 * 1024 // 2
+    _SKINNY_GROUP_SIZES = {32, 64, 128}
 
     def __init__(
         self, weight_config: dict[str, Any], input_config: Optional[dict[str, Any]]
     ):
-        from sglang.kernels.ops.quantization.awq_triton import (
-            AWQ_TRITON_SUPPORTED_GROUP_SIZES,
-        )
-
         self.group_size = weight_config.get("group_size")
+        self.is_sym = bool(weight_config.get("symmetric", False))
         self.pack_factor = 8
-        self.out_dtype = torch.get_default_dtype()
-        # ROCm has no native AWQ GEMM, so the shared AWQ path dequantizes the
-        # whole weight to bf16 on every forward -- more memory traffic than the
-        # unquantized model. Use the fused triton int4 GEMM for the small-M
-        # (decode) shapes instead, where it is ~3x faster.
-        self.use_fused_gemm = (
-            is_hip() and self.group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES
+        self.use_hybrid_rocm = (
+            is_hip() and self.group_size in self._SKINNY_GROUP_SIZES
         )
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Turing and up (same as AWQ); on ROCm the triton kernel is used.
         return 75
 
     def create_weights(
@@ -74,12 +53,11 @@ class QuarkW4A16Int4(QuarkLinearScheme):
         if output_size_per_partition % self.pack_factor != 0:
             raise ValueError(
                 f"Output size {output_size_per_partition} is not divisible by "
-                f"the int4 pack factor {self.pack_factor}. This can be caused "
+                f"the INT4 pack factor {self.pack_factor}. This can be caused "
                 "by too large a tensor parallel size."
             )
 
         layer.logical_widths = output_partition_sizes
-
         weight = PackedvLLMParameter(
             data=torch.empty(
                 input_size_per_partition,
@@ -120,43 +98,100 @@ class QuarkW4A16Int4(QuarkLinearScheme):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        flip = torch.tensor(
-            _INT4_SIGN_FLIP, dtype=torch.int32, device=layer.weight.device
-        )
-        layer.weight = Parameter(
-            torch.bitwise_xor(layer.weight.data, flip), requires_grad=False
-        )
+        if self.use_hybrid_rocm:
+            from sglang.kernels.ops.quantization.gptq_triton import (
+                repack_awq_qzeros_to_skinny,
+                repack_awq_w4_to_skinny,
+            )
+
+            # Quark stores signed INT4 in AWQ's N-packed/interleaved layout.
+            # Convert once to unsigned zero-point-8 values in the shared
+            # ExLlama K-packed layout used by both fused ROCm kernels.
+            weight = repack_awq_w4_to_skinny(
+                layer.weight.data.contiguous(), signed=True
+            )
+            if self.is_sym:
+                weight_zero_point = torch.empty(
+                    0, dtype=torch.int32, device=layer.weight_zero_point.device
+                )
+            else:
+                weight_zero_point = repack_awq_qzeros_to_skinny(
+                    layer.weight_zero_point.data.contiguous(), signed=True
+                )
+            weight_scale = layer.weight_scale.data.t().contiguous()
+        else:
+            # Preserve the branch's CUDA path: convert signed Quark nibbles to
+            # standard unsigned AWQ values without changing their layout.
+            sign_flip = torch.tensor(
+                -2004318072,  # 0x88888888 as signed int32
+                dtype=torch.int32,
+                device=layer.weight.device,
+            )
+            weight = torch.bitwise_xor(layer.weight.data, sign_flip)
+            weight_zero_point = torch.bitwise_xor(
+                layer.weight_zero_point.data, sign_flip
+            )
+            weight_scale = layer.weight_scale.data
+
+        layer.weight = Parameter(weight, requires_grad=False)
         layer.weight_zero_point = Parameter(
-            torch.bitwise_xor(layer.weight_zero_point.data, flip), requires_grad=False
+            weight_zero_point, requires_grad=False
         )
-        layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
+        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
+        reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
+
+        if self.use_hybrid_rocm:
+            from sglang.kernels.ops.quantization.gptq_triton import (
+                gptq_w4a16_skinny_gemm,
+            )
+
+            m, k = reshaped_x.shape
+            out_shape = x.shape[:-1] + (layer.weight.shape[0],)
+            use_native_skinny = (
+                m <= self._SKINNY_MAX_BATCH_SIZE
+                and k * m <= self._SKINNY_LDS_ELEMENTS
+                and hasattr(torch.ops.sgl_kernel, "wvSplitK_int4_g")
+            )
+            zero_points = None if self.is_sym else layer.weight_zero_point
+
+            if use_native_skinny:
+                cu_count = torch.cuda.get_device_properties(
+                    reshaped_x.device
+                ).multi_processor_count
+                out = torch.ops.sgl_kernel.wvSplitK_int4_g.default(
+                    layer.weight,
+                    reshaped_x,
+                    layer.weight_scale,
+                    zero_points,
+                    bias,
+                    cu_count,
+                    self.group_size,
+                )
+            else:
+                out = gptq_w4a16_skinny_gemm(
+                    input=reshaped_x,
+                    qweight=layer.weight,
+                    scales=layer.weight_scale,
+                    group_size=self.group_size,
+                    qzeros=zero_points,
+                )
+                if bias is not None:
+                    out.add_(bias)
+            return out.reshape(out_shape)
+
         from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
             awq_dequantize,
         )
 
         out_shape = x.shape[:-1] + (layer.weight.shape[-1] * self.pack_factor,)
-        reshaped_x = x.reshape(-1, x.shape[-1])
-
-        if reshaped_x.shape[0] <= _FUSED_GEMM_MAX_ROWS and self.use_fused_gemm:
-            from sglang.kernels.ops.quantization.awq_triton import awq_gemm_triton
-
-            out = awq_gemm_triton(
-                reshaped_x,
-                layer.weight,
-                layer.weight_scale,
-                layer.weight_zero_point,
-                split_k_iters=1,
-            )
-        else:
-            weight = awq_dequantize(
-                layer.weight, layer.weight_scale, layer.weight_zero_point
-            )
-            out = torch.matmul(reshaped_x, weight)
-
+        weight = awq_dequantize(
+            layer.weight, layer.weight_scale, layer.weight_zero_point
+        )
+        out = torch.matmul(reshaped_x, weight)
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)

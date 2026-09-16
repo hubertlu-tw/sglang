@@ -536,12 +536,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return [1 for _ in loaded_shard_id]
 
         packed_dim = getattr(param, "packed_dim", None)
-        if packed_dim is not None and packed_dim == getattr(param, "output_dim", None):
-            # int4 checkpoints (AWQ/Quark) pack several values per int32 along
-            # the output dim, so the checkpoint-side splits are in packed units.
+        if packed_dim is not None and packed_dim == getattr(
+            param, "output_dim", None
+        ):
+            # INT4 checkpoints pack several output values into each int32, so
+            # checkpoint-side split sizes must be expressed in packed units.
             packed_factor = param.packed_factor
             return [
-                module.output_sizes[idx] // packed_factor for idx in loaded_shard_id
+                module.output_sizes[idx] // packed_factor
+                for idx in loaded_shard_id
             ]
 
         # Normal weight / non-block quant tensor

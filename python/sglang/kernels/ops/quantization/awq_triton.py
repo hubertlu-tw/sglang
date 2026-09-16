@@ -133,7 +133,7 @@ def awq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    # tl.dot refuses to accumulate in bf16; accumulate in fp32 and cast on store.
+    # Triton does not support bf16 accumulation in tl.dot.
     accumulator_dtype = (
         tl.float32 if c_ptr.type.element_ty == tl.bfloat16 else c_ptr.type.element_ty
     )
