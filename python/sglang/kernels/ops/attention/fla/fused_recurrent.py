@@ -354,6 +354,35 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
 
+    if use_qk_l2norm_in_kernel:
+        from sglang.kernels.ops.attention import (
+            gdn_packed_decode_gfx1151 as gfx1151_decode,
+        )
+
+        if gfx1151_decode.covered(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state,
+            out,
+            ssm_state_indices,
+            H,
+        ):
+            gfx1151_decode.gdn_packed_decode_gfx1151(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                scale,
+                initial_state,
+                out,
+                ssm_state_indices,
+            )
+            return out, initial_state
+
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
         raise ValueError(
