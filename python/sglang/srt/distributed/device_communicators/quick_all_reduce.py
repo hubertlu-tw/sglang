@@ -17,16 +17,19 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 @cache
 def qr_rocm_arch_available():
-    if not _is_hip:
+    # QuickReduce targets CDNA gfx94x/gfx95x. Do not import or JIT it on gfx1250.
+    if not _is_hip or _is_gfx1250_supported:
         return False
     try:
         props = torch.cuda.get_device_properties(0)

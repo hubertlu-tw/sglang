@@ -495,10 +495,11 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
+            if is_hip() and not self._deterministic_collectives_enabled():
                 try:
                     # Prefer AITER QuickReduce when globally enabled and
                     # available; otherwise retain the bundled implementation.
+                    # Deterministic inference excludes QuickReduce codecs.
                     # Based on quickreduce (https://github.com/mk1-project/quickreduce).
                     self.qr_comm = create_quick_allreduce(
                         group=self.cpu_group, device=self.device
@@ -740,6 +741,7 @@ class GroupCoordinator:
         )
         should_use_quick_allreduce = (
             is_hip()
+            and not self._deterministic_collectives_enabled()
             and self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
@@ -788,6 +790,69 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    def _fused_ar_rmsnorm_use_1stage(self, input_: torch.Tensor) -> bool:
+        """Select the custom-AR fusion stage.
+
+        ``SGLANG_USE_1STAGE_ALLREDUCE`` wins when set. Otherwise use the
+        MI355X crossover from the fused AR+RMSNorm study: 1-stage stays
+        faster across the whole custom-AR window at TP2, and only through
+        128 KiB at TP4 and TP8. This is stage selection, not the 64 MiB
+        custom-AR eligibility limit.
+        """
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            return bool(envs.SGLANG_USE_1STAGE_ALLREDUCE.get())
+        if self.world_size <= 2:
+            return True
+        total_bytes = input_.numel() * input_.element_size()
+        return total_bytes <= 128 * 1024
+
+    def _quickreduce_rmsnorm_bytes_allowed(self, input_: torch.Tensor) -> bool:
+        """Fused INT4 QuickReduce RMSNorm size floor from the MI355X study.
+
+        AITER's own minimum still applies. These floors skip the first
+        eligible point where fused QuickReduce was slower than custom AR:
+        TP2 below 2 MiB and TP4 below 4 MiB. TP8 already starts at 8 MiB.
+        """
+        floors = {2: 2 * 1024 * 1024, 4: 4 * 1024 * 1024, 8: 8 * 1024 * 1024}
+        floor = floors.get(self.world_size)
+        if floor is None:
+            return False
+        return input_.numel() * input_.element_size() >= floor
+
+    def _quick_allreduce_rmsnorm_eligible(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        use_1stage_ar: bool,
+    ) -> bool:
+        del use_1stage_ar  # CAR stage is independent of the QuickReduce gate.
+        qr_comm = self.qr_comm
+        if not self._quickreduce_rmsnorm_codec_allowed():
+            return False
+        if not self._quickreduce_rmsnorm_bytes_allowed(input_):
+            return False
+        return bool(
+            is_hip()
+            and not self._deterministic_collectives_enabled()
+            and qr_comm is not None
+            and not getattr(qr_comm, "disabled", True)
+            and hasattr(qr_comm, "should_quick_allreduce_rmsnorm")
+            and hasattr(qr_comm, "quick_all_reduce_rmsnorm")
+            and qr_comm.should_quick_allreduce_rmsnorm(
+                input_, residual_inp_, weight_, weight_.numel()
+            )
+        )
+
+    def _quickreduce_rmsnorm_codec_allowed(self) -> bool:
+        """Skip lossless FP QuickReduce RMSNorm.
+
+        On MI355X it was slower than two-stage custom AR at TP2, TP4, and TP8.
+        Compressed codecs remain available as an explicit quantization opt-in.
+        """
+        regime = getattr(self.qr_comm, "qr_quant_level", None)
+        return getattr(regime, "name", None) != "FP"
+
     def fused_allreduce_rmsnorm(
         self,
         input_: torch.Tensor,
@@ -795,7 +860,19 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        """Attempt fused all-reduce + RMSNorm via ROCm communicators."""
+        use_1stage_ar = self._fused_ar_rmsnorm_use_1stage(input_)
+        # AITER QuickReduce is a two-shot all-reduce with a row-local
+        # residual-add + RMSNorm epilogue. Try it only for shapes that would
+        # otherwise use two-stage custom AR.
+        qr_comm = self.qr_comm
+        if self._quick_allreduce_rmsnorm_eligible(
+            input_, residual_inp_, weight_, use_1stage_ar
+        ):
+            return qr_comm.quick_all_reduce_rmsnorm(
+                input_, residual_inp_, weight_, eps, weight_.numel()
+            )
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -812,18 +889,6 @@ class GroupCoordinator:
 
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
-
-        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
-        # The 1-stage kernel launches one block per token and is capped at
-        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
-        # prefill batches fall through to the 2-stage kernel instead of
-        # hitting a runtime error.  AITER's C++ dispatch already gates
-        # which hidden_dims have valid 1-stage support.
-        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
-            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
-        else:
-            total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -941,6 +1006,7 @@ class GroupCoordinator:
         if should_use_quick_allreduce is None:
             should_use_quick_allreduce = (
                 is_rocm
+                and not self._deterministic_collectives_enabled()
                 and self.qr_comm is not None
                 and not self.qr_comm.disabled
                 and self.qr_comm.should_quick_allreduce(input_)
@@ -1323,6 +1389,11 @@ class GroupCoordinator:
 
     @staticmethod
     def _deterministic_collectives_enabled() -> bool:
+        """Whether collectives must stay on SGLang's deterministic policy.
+
+        QuickReduce codecs and the optional BF16-to-FP16 cast are outside that
+        contract, so QuickReduce stays disabled while this policy is on.
+        """
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             return envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()

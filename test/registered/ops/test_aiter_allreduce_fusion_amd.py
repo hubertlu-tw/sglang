@@ -127,7 +127,10 @@ def _run_residual_accuracy_check():
         frac_nonzero = (diff > 0).float().mean().item()
 
         nbytes = m * n * dtype.itemsize
-        stage = "1-stage" if nbytes <= 128 * 1024 else "2-stage"
+        if world_size <= 2:
+            stage = "1-stage"
+        else:
+            stage = "1-stage" if nbytes <= 128 * 1024 else "2-stage"
         passed = max_diff <= ATOL
 
         if not passed:
