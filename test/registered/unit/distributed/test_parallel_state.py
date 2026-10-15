@@ -235,6 +235,84 @@ def test_auto_outplace_resolution_prefers_quick_allreduce():
     assert method == "qr"
 
 
+def _fused_rmsnorm_coordinator(qr_accepts: bool):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 8
+    coordinator.qr_comm = Mock(disabled=False)
+    coordinator.qr_comm.should_quick_allreduce_rmsnorm.return_value = qr_accepts
+    coordinator.qr_comm.quick_all_reduce_rmsnorm.return_value = ("qr", "qr")
+    coordinator.ca_comm = Mock(disabled=False, _IS_CAPTURING=False)
+    del coordinator.ca_comm.fused_allreduce_rmsnorm
+    coordinator.ca_comm.custom_fused_ar_rms.return_value = ("ca", "ca")
+    return coordinator
+
+
+@pytest.mark.parametrize(
+    "tokens, qr_accepts, enabled, expected",
+    [
+        # 2-stage sizes go to QuickReduce when it accepts the input.
+        (2048, True, True, "qr"),
+        # 1-stage sizes stay on CustomAllReduce.
+        (8, True, True, "ca"),
+        # QuickReduce declines (codec off, too small, row size, ...).
+        (2048, False, True, "ca"),
+        # Opt-out keeps fused sites lossless.
+        (2048, True, False, "ca"),
+    ],
+)
+def test_fused_allreduce_rmsnorm_backend_selection(
+    monkeypatch, tokens, qr_accepts, enabled, expected
+):
+    monkeypatch.delenv("SGLANG_USE_1STAGE_ALLREDUCE", raising=False)
+    monkeypatch.setenv("SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION", str(int(enabled)))
+    coordinator = _fused_rmsnorm_coordinator(qr_accepts)
+    input_ = torch.zeros(tokens, 4096, dtype=torch.bfloat16)
+    residual = torch.zeros_like(input_)
+    weight = torch.ones(4096, dtype=torch.bfloat16)
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(parallel_state, "is_hip", return_value=True),
+        patch.object(
+            parallel_state, "is_in_tc_piecewise_cuda_graph", return_value=False
+        ),
+    ):
+        output = coordinator.fused_allreduce_rmsnorm(input_, residual, weight, 1e-6)
+
+    assert output == (expected, expected)
+    if expected == "qr":
+        coordinator.qr_comm.quick_all_reduce_rmsnorm.assert_called_once_with(
+            input_, residual, weight, 1e-6, 4096
+        )
+        coordinator.ca_comm.custom_fused_ar_rms.assert_not_called()
+    else:
+        coordinator.qr_comm.quick_all_reduce_rmsnorm.assert_not_called()
+
+
+def test_fused_allreduce_rmsnorm_skips_quick_allreduce_under_piecewise_graph(
+    monkeypatch,
+):
+    monkeypatch.delenv("SGLANG_USE_1STAGE_ALLREDUCE", raising=False)
+    coordinator = _fused_rmsnorm_coordinator(qr_accepts=True)
+    input_ = torch.zeros(2048, 4096, dtype=torch.bfloat16)
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(parallel_state, "is_hip", return_value=True),
+        patch.object(
+            parallel_state, "is_in_tc_piecewise_cuda_graph", return_value=True
+        ),
+    ):
+        output = coordinator.fused_allreduce_rmsnorm(
+            input_, torch.zeros_like(input_), torch.ones(4096), 1e-6
+        )
+
+    assert output == ("ca", "ca")
+    coordinator.qr_comm.quick_all_reduce_rmsnorm.assert_not_called()
+
+
 @pytest.mark.parametrize("has_quick_allreduce", [False, True])
 def test_destroy_handles_quick_allreduce_before_process_groups(has_quick_allreduce):
     coordinator = parallel_state.GroupCoordinator.__new__(

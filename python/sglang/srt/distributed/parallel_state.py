@@ -829,7 +829,27 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        """Attempt fused all-reduce + RMSNorm via the QuickReduce or custom
+        all-reduce communicator. ROCm/HIP Only"""
+        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
+        # The 1-stage kernel launches one block per token and is capped at
+        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
+        # prefill batches fall through to the 2-stage kernel instead of
+        # hitting a runtime error.  AITER's C++ dispatch already gates
+        # which hidden_dims have valid 1-stage support.
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            use_1stage_ar = total_bytes <= 128 * 1024
+
+        if not use_1stage_ar and self._should_quick_allreduce_rmsnorm(
+            input_, residual_inp_, weight_
+        ):
+            return self.qr_comm.quick_all_reduce_rmsnorm(
+                input_, residual_inp_, weight_, eps, weight_.numel()
+            )
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -846,18 +866,6 @@ class GroupCoordinator:
 
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
-
-        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
-        # The 1-stage kernel launches one block per token and is capped at
-        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
-        # prefill batches fall through to the 2-stage kernel instead of
-        # hitting a runtime error.  AITER's C++ dispatch already gates
-        # which hidden_dims have valid 1-stage support.
-        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
-            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
-        else:
-            total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -882,6 +890,28 @@ class GroupCoordinator:
             use_1stage_ar,
         )
         return fused_outputs
+
+    def _should_quick_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+    ) -> bool:
+        qr_comm = self.qr_comm
+        return (
+            is_hip()
+            and qr_comm is not None
+            and not qr_comm.disabled
+            and envs.SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION.get()
+            # The torch.compile and piecewise graph paths trace the custom
+            # all-reduce kernels only.
+            and not torch.compiler.is_compiling()
+            and not is_in_tc_piecewise_cuda_graph()
+            and input_.shape == residual_inp_.shape
+            and qr_comm.should_quick_allreduce_rmsnorm(
+                input_, residual_inp_, weight_, weight_.numel()
+            )
+        )
 
     def fused_allreduce_rmsnorm_quant_per_group(
         self,

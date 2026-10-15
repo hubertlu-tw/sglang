@@ -1716,6 +1716,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On AMD, let fused all-reduce + RMSNorm sites (<code>--enable-aiter-allreduce-fusion</code>) use AITER's QuickReduce + RMSNorm kernel for 2-stage sizes when an AITER QuickReduce codec (e.g. <code>INT4</code>) is configured and accepts the input. The codec is lossy; set to <code>0</code> to keep those sites on the lossless custom all-reduce kernel.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_PCIE_IPC_ALLREDUCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's PCIe-IPC all-reduce on switch-free intra-node hosts (no NVLink, no multicast), where the other custom all-reduce backends do not apply. Serves bf16 decode reductions that fit the workspace bound; everything else stays on NCCL. Left off under deterministic inference.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

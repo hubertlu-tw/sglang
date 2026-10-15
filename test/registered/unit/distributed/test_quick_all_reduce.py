@@ -82,6 +82,35 @@ def test_adapter_treats_missing_eligibility_method_as_ineligible():
     assert not adapter.should_quick_allreduce(torch.zeros(4))
 
 
+class _FusedRmsNormQuickAllReduce(_OutOfTreeQuickAllReduce):
+    def should_quick_allreduce_rmsnorm(self, inp, residual, weight, hidden_dim):
+        return inp.shape[-1] == hidden_dim
+
+    def quick_all_reduce_rmsnorm(self, inp, residual, weight, eps, hidden_dim):
+        return inp + 1, residual + 1
+
+
+def test_adapter_forwards_fused_rmsnorm():
+    adapter = quick_all_reduce_module._QuickAllReduceAdapter(
+        _FusedRmsNormQuickAllReduce()
+    )
+    inp, residual, weight = torch.zeros(2, 4), torch.ones(2, 4), torch.ones(4)
+
+    assert adapter.should_quick_allreduce_rmsnorm(inp, residual, weight, 4)
+    assert not adapter.should_quick_allreduce_rmsnorm(inp, residual, weight, 8)
+    out, residual_out = adapter.quick_all_reduce_rmsnorm(inp, residual, weight, 1e-6, 4)
+    torch.testing.assert_close(out, torch.ones(2, 4))
+    torch.testing.assert_close(residual_out, torch.full((2, 4), 2.0))
+
+
+def test_adapter_without_fused_kernel_declines_fused_rmsnorm():
+    # The bundled INT8 codec has no fused AR+RMSNorm kernel.
+    adapter = quick_all_reduce_module._QuickAllReduceAdapter(_OutOfTreeQuickAllReduce())
+    inp = torch.zeros(2, 4)
+
+    assert not adapter.should_quick_allreduce_rmsnorm(inp, inp, torch.ones(4), 4)
+
+
 def test_legacy_environment_aliases_do_not_override_aiter(monkeypatch):
     monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
     monkeypatch.setenv("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "0")

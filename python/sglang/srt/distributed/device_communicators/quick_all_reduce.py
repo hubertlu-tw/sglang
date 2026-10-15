@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Any, Optional, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -292,6 +292,36 @@ class _QuickAllReduceAdapter:
         if out is None:
             return reduce(inp)
         return reduce(inp, out=out)
+
+    def should_quick_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        hidden_dim: int,
+    ) -> bool:
+        # Only AITER's codecs have the fused kernel; the bundled INT8 codec
+        # leaves fused sites to CustomAllReduce.
+        eligibility = getattr(
+            self._communicator, "should_quick_allreduce_rmsnorm", None
+        )
+        if eligibility is None or not hasattr(
+            self._communicator, "quick_all_reduce_rmsnorm"
+        ):
+            return False
+        return bool(eligibility(inp, residual, weight, hidden_dim))
+
+    def quick_all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        hidden_dim: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._communicator.quick_all_reduce_rmsnorm(
+            inp, residual, weight, eps, hidden_dim
+        )
 
     def close(self) -> None:
         close = getattr(self._communicator, "close", None)
