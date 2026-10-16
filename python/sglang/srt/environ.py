@@ -1391,10 +1391,10 @@ class Envs:
     # Set to 1: force enable (even without --enable-deterministic-inference)
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
-    # Fused AR+RMSNorm sites take AITER's QuickReduce+RMSNorm kernel when a
-    # QuickReduce codec is configured and accepts the input. Set to 0 to keep
-    # those sites on the lossless CustomAllReduce kernel.
-    SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION = EnvBool(True)
+    # Let fused AR+RMSNorm sites use QuickReduce when a codec is configured
+    # and accepts the input. Off by default: with INT4 at every fused site,
+    # Qwen3.5-397B TP4 GSM8K falls from 0.95 to as low as 0.01.
+    SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION = EnvBool(False)
     # NCCL channel count pinned on CUDA so the all-reduce reduces a token the
     # same way whatever else shares its batch. Raise it to buy back bandwidth
     # on links that can drive more channels.

@@ -1717,8 +1717,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On AMD, let fused all-reduce + RMSNorm sites (<code>--enable-aiter-allreduce-fusion</code>) use AITER's QuickReduce + RMSNorm kernel for 2-stage sizes when an AITER QuickReduce codec (e.g. <code>INT4</code>) is configured and accepts the input. The codec is lossy; set to <code>0</code> to keep those sites on the lossless custom all-reduce kernel.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On AMD, let fused all-reduce + RMSNorm sites (<code>--enable-aiter-allreduce-fusion</code>) use QuickReduce when an AITER QuickReduce codec is configured and accepts the input. The codec is lossy and off by default: with <code>INT4</code> at every fused site, Qwen3.5-397B TP4 GSM8K accuracy collapses. Validate accuracy per model before enabling.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_PCIE_IPC_ALLREDUCE</code></td>

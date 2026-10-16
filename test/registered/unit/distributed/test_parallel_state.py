@@ -235,25 +235,32 @@ def test_auto_outplace_resolution_prefers_quick_allreduce():
     assert method == "qr"
 
 
-def _fused_rmsnorm_coordinator(qr_accepts: bool):
+def _fused_rmsnorm_coordinator(qr_accepts: bool, world_size: int = 8):
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator
     )
-    coordinator.world_size = 8
+    coordinator.world_size = world_size
     coordinator.qr_comm = Mock(disabled=False)
     coordinator.qr_comm.should_quick_allreduce_rmsnorm.return_value = qr_accepts
     coordinator.qr_comm.quick_all_reduce_rmsnorm.return_value = ("qr", "qr")
     coordinator.ca_comm = Mock(disabled=False, _IS_CAPTURING=False)
     del coordinator.ca_comm.fused_allreduce_rmsnorm
     coordinator.ca_comm.custom_fused_ar_rms.return_value = ("ca", "ca")
+    coordinator.ca_comm.custom_fused_ar_rms_per_group_quant.return_value = (
+        "ca-pgq",
+        "ca-pgq",
+        "ca-pgq",
+    )
     return coordinator
 
 
 @pytest.mark.parametrize(
     "tokens, qr_accepts, enabled, expected",
     [
-        # 2-stage sizes go to QuickReduce when it accepts the input.
+        # 16 MiB: the fused QuickReduce+RMSNorm kernel.
         (2048, True, True, "qr"),
+        # 4 MiB: None, so the caller runs QuickReduce and RMSNorm separately.
+        (512, True, True, None),
         # 1-stage sizes stay on CustomAllReduce.
         (8, True, True, "ca"),
         # QuickReduce declines (codec off, too small, row size, ...).
@@ -281,20 +288,64 @@ def test_fused_allreduce_rmsnorm_backend_selection(
     ):
         output = coordinator.fused_allreduce_rmsnorm(input_, residual, weight, 1e-6)
 
-    assert output == (expected, expected)
+    assert output == (None if expected is None else (expected, expected))
     if expected == "qr":
         coordinator.qr_comm.quick_all_reduce_rmsnorm.assert_called_once_with(
             input_, residual, weight, 1e-6, 4096
         )
-        coordinator.ca_comm.custom_fused_ar_rms.assert_not_called()
     else:
         coordinator.qr_comm.quick_all_reduce_rmsnorm.assert_not_called()
+    if expected != "ca":
+        coordinator.ca_comm.custom_fused_ar_rms.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "world_size, tokens, qr_accepts, expected",
+    [
+        # At or above the per-world-size crossover, QuickReduce plus a
+        # separate quant wins: decline so the caller takes that path.
+        (8, 1024, True, None),
+        (4, 512, True, None),
+        (2, 256, True, None),
+        # Below it, the CustomAllReduce AR+RMSNorm+quant kernel wins.
+        (4, 256, True, "ca-pgq"),
+        (2, 128, True, "ca-pgq"),
+        # QuickReduce declines.
+        (8, 1024, False, "ca-pgq"),
+    ],
+)
+def test_fused_allreduce_rmsnorm_quant_per_group_backend_selection(
+    monkeypatch, world_size, tokens, qr_accepts, expected
+):
+    monkeypatch.delenv("SGLANG_USE_1STAGE_ALLREDUCE", raising=False)
+    monkeypatch.setenv("SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION", "1")
+    coordinator = _fused_rmsnorm_coordinator(qr_accepts, world_size=world_size)
+    input_ = torch.zeros(tokens, 4096, dtype=torch.bfloat16)
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(parallel_state, "is_hip", return_value=True),
+        patch.object(parallel_state, "is_gfx95_supported", return_value=True),
+        patch.object(
+            parallel_state, "is_in_tc_piecewise_cuda_graph", return_value=False
+        ),
+    ):
+        output = coordinator.fused_allreduce_rmsnorm_quant_per_group(
+            input_, torch.zeros_like(input_), torch.ones(4096), 1e-6
+        )
+
+    if expected is None:
+        assert output is None
+        coordinator.ca_comm.custom_fused_ar_rms_per_group_quant.assert_not_called()
+    else:
+        assert output == (expected,) * 3
 
 
 def test_fused_allreduce_rmsnorm_skips_quick_allreduce_under_piecewise_graph(
     monkeypatch,
 ):
     monkeypatch.delenv("SGLANG_USE_1STAGE_ALLREDUCE", raising=False)
+    monkeypatch.setenv("SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION", "1")
     coordinator = _fused_rmsnorm_coordinator(qr_accepts=True)
     input_ = torch.zeros(2048, 4096, dtype=torch.bfloat16)
 

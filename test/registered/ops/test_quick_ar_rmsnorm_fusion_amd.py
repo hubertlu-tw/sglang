@@ -30,6 +30,7 @@ def _run_distributed_check() -> None:
 
     from sglang.srt.distributed.communication_op import (
         tensor_model_parallel_fused_allreduce_rmsnorm,
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
     )
     from sglang.srt.distributed.parallel_state import (
         destroy_distributed_environment,
@@ -41,6 +42,7 @@ def _run_distributed_check() -> None:
     )
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.utils import is_gfx95_supported
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -73,7 +75,10 @@ def _run_distributed_check() -> None:
     dtype, eps = torch.bfloat16, 1e-6
     failures = []
 
-    def check(tokens: int, hidden: int, expect_qr: bool, label: str) -> None:
+    def check(tokens: int, hidden: int, expect: str, label: str) -> None:
+        """``expect`` is ``qr`` (fused QuickReduce kernel), ``ca``
+        (CustomAllReduce kernel) or ``fallback`` (None, so the caller runs
+        the all-reduce and the RMSNorm separately)."""
         gen = torch.Generator(device=device).manual_seed(1234 + rank)
         x = torch.randn(tokens, hidden, dtype=dtype, device=device, generator=gen)
         gen_res = torch.Generator(device=device).manual_seed(7)
@@ -95,27 +100,63 @@ def _run_distributed_check() -> None:
         before = calls["qr"]
         result = tensor_model_parallel_fused_allreduce_rmsnorm(x, residual, weight, eps)
         torch.cuda.synchronize()
-        used_qr = calls["qr"] > before
         if result is None:
-            failures.append(f"{label}: fused path returned None")
+            got = "fallback"
+        else:
+            got = "qr" if calls["qr"] > before else "ca"
+        if got != expect:
+            failures.append(f"{label}: took {got}, expected {expect}")
+            return
+        if result is None:
+            if rank == 0:
+                print(f"{label}: {got}", flush=True)
             return
         out, residual_out = result
-        limit = QUICK_REDUCE_L2_LIMIT if used_qr else CUSTOM_ALL_REDUCE_L2_LIMIT
+        limit = QUICK_REDUCE_L2_LIMIT if got == "qr" else CUSTOM_ALL_REDUCE_L2_LIMIT
         l2 = max(_relative_l2(out, ref_out), _relative_l2(residual_out, ref_residual))
-        if used_qr != expect_qr:
-            failures.append(f"{label}: used_qr={used_qr}, expected {expect_qr}")
         if not l2 <= limit:
             failures.append(f"{label}: relative L2 {l2:.3e} > {limit:.1e}")
         if rank == 0:
-            print(f"{label}: used_qr={used_qr} l2={l2:.3e}", flush=True)
+            print(f"{label}: {got} l2={l2:.3e}", flush=True)
 
-    check(2048, 4096, expect_qr=True, label="2048x4096")
-    check(2048, 8192, expect_qr=True, label="2048x8192")
-    check(8, 4096, expect_qr=False, label="8x4096 (1-stage)")
+    check(2048, 4096, expect="qr", label="2048x4096")
+    check(2048, 8192, expect="qr", label="2048x8192")
+    # 4 MiB: QuickReduce takes it at TP2/TP4 but runs unfused; at TP8 it is
+    # below QuickReduce's INT4 minimum.
+    check(
+        512,
+        4096,
+        expect="ca" if world_size == 8 else "fallback",
+        label="512x4096",
+    )
+    check(8, 4096, expect="ca", label="8x4096 (1-stage)")
     # 7168 * 2 bytes does not divide QuickReduce's 32 KiB tile.
-    check(2048, 7168, expect_qr=False, label="2048x7168 (row size)")
+    check(2048, 7168, expect="ca", label="2048x7168 (row size)")
     with envs.SGLANG_ENABLE_QUICK_AR_RMSNORM_FUSION.override(False):
-        check(2048, 4096, expect_qr=False, label="2048x4096 (opt-out)")
+        check(2048, 4096, expect="ca", label="2048x4096 (opt-out)")
+
+    # FP8-consumer sites: large sizes leave the CustomAllReduce
+    # AR+RMSNorm+quant kernel for QuickReduce plus a separate quant.
+    if is_gfx95_supported():
+        for tokens, expect_none in ((2048, True), (16, False)):
+            x = torch.randn(tokens, 4096, dtype=dtype, device=device)
+            pgq = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+                x,
+                torch.randn_like(x),
+                torch.ones(4096, dtype=dtype, device=device),
+                eps,
+            )
+            if (pgq is None) != expect_none:
+                failures.append(
+                    f"per-group quant {tokens}x4096: returned "
+                    f"{'None' if pgq is None else 'a result'}"
+                )
+            elif rank == 0:
+                print(
+                    f"per-group quant {tokens}x4096: "
+                    f"{'deferred to QuickReduce' if pgq is None else 'CustomAllReduce'}",
+                    flush=True,
+                )
 
     # Graph replay must reproduce the eager QuickReduce result.
     tokens, hidden = 2048, 4096

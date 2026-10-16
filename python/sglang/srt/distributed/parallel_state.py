@@ -90,6 +90,19 @@ _is_musa = is_musa()
 # rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
 _AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
+# Fused AR+RMSNorm crossovers on MI355X with the INT4 QuickReduce codec (see
+# benchmark/kernels/all_reduce/benchmark_quick_ar_rmsnorm_rocm.py). Below the
+# first size, a QuickReduce all-reduce followed by a separate RMSNorm beats
+# the fused QuickReduce+RMSNorm kernel. Below the per-world-size sizes, the
+# CustomAllReduce AR+RMSNorm+per-group-quant kernel beats QuickReduce plus a
+# separate quant at FP8-consumer sites.
+_QR_RMSNORM_FUSED_MIN_BYTES = 8 * 1024 * 1024
+_QR_FP8_SITE_MIN_BYTES = {
+    2: 2 * 1024 * 1024,
+    4: 4 * 1024 * 1024,
+    8: 8 * 1024 * 1024,
+}
+
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 # use int value instead of ReduceOp.SUM to support torch compile
@@ -837,15 +850,19 @@ class GroupCoordinator:
         # prefill batches fall through to the 2-stage kernel instead of
         # hitting a runtime error.  AITER's C++ dispatch already gates
         # which hidden_dims have valid 1-stage support.
+        total_bytes = input_.numel() * input_.element_size()
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
-            total_bytes = input_.numel() * input_.element_size()
             use_1stage_ar = total_bytes <= 128 * 1024
 
         if not use_1stage_ar and self._should_quick_allreduce_rmsnorm(
             input_, residual_inp_, weight_
         ):
+            if total_bytes < _QR_RMSNORM_FUSED_MIN_BYTES:
+                # The caller's fallback runs the QuickReduce all-reduce and
+                # the RMSNorm separately, which is faster at these sizes.
+                return None
             return self.qr_comm.quick_all_reduce_rmsnorm(
                 input_, residual_inp_, weight_, eps, weight_.numel()
             )
@@ -941,6 +958,13 @@ class GroupCoordinator:
         caller can skip the post-kernel scale transpose.
         """
         if not (is_hip() and is_gfx95_supported()):
+            return None
+
+        if input_.numel() * input_.element_size() >= _QR_FP8_SITE_MIN_BYTES.get(
+            self.world_size, float("inf")
+        ) and self._should_quick_allreduce_rmsnorm(input_, residual_inp_, weight_):
+            # QuickReduce followed by a separate quant beats this kernel here;
+            # the caller's fallback takes that path.
             return None
 
         ca_comm = self.ca_comm
