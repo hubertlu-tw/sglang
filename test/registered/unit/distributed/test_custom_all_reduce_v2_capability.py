@@ -41,6 +41,7 @@ def _patch_group(monkeypatch, *, world_size, same_node):
 def test_topology_capability(
     monkeypatch, same_node, has_fabric_clique, uses_vmm, expected
 ):
+    monkeypatch.setattr(custom_all_reduce_v2, "_IS_HIP", False)
     world_size = 8 if same_node else 16
     group, device = _patch_group(
         monkeypatch,
@@ -86,6 +87,76 @@ def test_topology_capability(
         )
     else:
         intra_node_capability.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("same_node", "is_gfx1250", "fabric_supported", "expected"),
+    [
+        (True, True, None, True),
+        (True, False, None, False),
+        (False, True, True, True),
+        (False, True, False, False),
+    ],
+)
+def test_rocm_topology_capability(
+    monkeypatch, same_node, is_gfx1250, fabric_supported, expected
+):
+    world_size = 4
+    group, device = _patch_group(
+        monkeypatch,
+        world_size=world_size,
+        same_node=same_node,
+    )
+    intra_node_capability = Mock(return_value=True)
+    monkeypatch.setattr(custom_all_reduce_v2, "_IS_HIP", True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "_is_gfx1250",
+        lambda device: is_gfx1250,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        intra_node_capability,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "is_one_nvlink_clique",
+        lambda group, device: pytest.fail(
+            "ROCm must not enter the CUDA multi-node clique path"
+        ),
+    )
+    fabric_capability = Mock()
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "probe_local_fabric_capability",
+        lambda device, rank: fabric_capability,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "validate_fabric_clique",
+        lambda capabilities: (
+            fabric_supported,
+            () if fabric_supported else ("fabric unavailable",),
+        ),
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2.dist,
+        "get_rank",
+        lambda group: 0,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2.dist,
+        "all_gather_object",
+        lambda output, value, group: output.__setitem__(
+            slice(None), [value] * len(output)
+        ),
+    )
+    if not same_node:
+        device = Mock(index=0)
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is expected
+    intra_node_capability.assert_not_called()
 
 
 if __name__ == "__main__":

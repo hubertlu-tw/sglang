@@ -67,6 +67,15 @@ struct alignas(128) Semaphore {
   SGL_DEVICE void put_release_multicast() {
     ptx::multimem_red_add_release(&m_flag, 1);
   }
+#ifdef USE_ROCM
+  SGL_DEVICE void publish(uint32_t value) {
+    __scoped_atomic_store_n(&m_flag, value, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+  }
+  SGL_DEVICE void wait(uint32_t value) const {
+    while (__scoped_atomic_load_n(&m_flag, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) < value)
+      ;
+  }
+#endif
 
  private:
   uint32_t m_flag;
@@ -160,13 +169,22 @@ struct Barrier {
  public:
   SGL_DEVICE Barrier(Semaphore* const* semaphores, uint32_t rank, uint32_t num_arrives)
       : m_counter(0), m_rank(rank), m_semaphores(semaphores) {
+#ifndef USE_ROCM
     const auto counter = semaphores[rank][blockIdx.x].counter_ptr();
     const auto signal = num_arrives * kWorldSize;
     m_counter = threadIdx.x == rank ? counter->inc(signal) : 0;
+#else
+    const auto counter = semaphores[rank][blockIdx.x].counter_ptr();
+    __shared__ uint32_t epoch;
+    if (threadIdx.x == 0) epoch = counter->inc(num_arrives);
+    __syncthreads();
+    m_counter = epoch;
+#endif
   }
 
   template <bool kNeedFence>
   SGL_DEVICE void arrive(uint32_t n) const {
+#ifndef USE_ROCM
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
       const auto bx = blockIdx.x;
       const auto semaphore = &m_semaphores[tx][bx];
@@ -185,6 +203,17 @@ struct Barrier {
         }
       }
     }
+#else
+    const auto bx = blockIdx.x;
+    const auto flag = m_counter + n + 1;
+    if (threadIdx.x == 0) {
+      m_semaphores[m_rank][bx].publish(flag);
+    }
+    __syncthreads();
+    if (const auto peer = threadIdx.x; peer < kWorldSize) {
+      m_semaphores[peer][bx].wait(flag);
+    }
+#endif
   }
 
   SGL_DEVICE void arrive_relaxed(uint32_t n) const {
@@ -410,7 +439,11 @@ struct PullPlaneObj : public tvm::ffi::Object, BasePlane {
       std::vector<TensorView> workspaces,  // world_size * [num_bytes]
       std::vector<TensorView> semaphores,  // world_size * [num_blocks]
       intptr_t mc_workspace_ptr,
-      intptr_t mc_semaphore_ptr);
+      intptr_t mc_semaphore_ptr,
+      std::vector<intptr_t> raw_workspaces,
+      std::vector<intptr_t> raw_semaphores,
+      int64_t raw_num_bytes,
+      uint32_t raw_num_blocks);
 
   uint32_t num_blocks;                               // semaphore capacity; callers clamp their grid to it
   int64_t num_bytes;                                 // per-rank workspace bytes

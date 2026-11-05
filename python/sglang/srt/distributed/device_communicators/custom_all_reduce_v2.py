@@ -35,6 +35,9 @@ from torch.distributed import ProcessGroup
 from sglang.kernels.ops.communication.all_reduce import (
     AllReduceAlgo,
     Communicator,
+    HIPFabricPlane,
+    HIPGraphIPCManager,
+    HIPIPCPlane,
     IPCManager,
     PullPlane,
     PushPlane,
@@ -60,10 +63,15 @@ from .custom_all_reduce_utils import (
     is_one_nvlink_clique,
     is_weak_contiguous,
 )
+from .gfx1250_fabric import (
+    probe_local_fabric_capability,
+    validate_fabric_clique,
+)
 
 logger = logging.getLogger(__name__)
 
 MB = 1024 * 1024
+_IS_HIP = torch.version.hip is not None
 
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
@@ -141,7 +149,16 @@ class CustomAllReduceV2:
         self.device = device
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
+        self._is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         base_config = get_all_reduce_config(self.world_size)
+        if _IS_HIP:
+            # The Lamport push protocol needs peer-visible marker semantics
+            # that gfx1250 lacks, so ROCm only uses the pull algorithms. Their
+            # barrier uses one flag slot per peer, as AITER does on gfx1250.
+            base_config = base_config._replace(
+                graph=base_config.graph._replace(one_shot_push_threshold=0),
+                eager=base_config.eager._replace(one_shot_push_threshold=0),
+            )
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
@@ -184,6 +201,14 @@ class CustomAllReduceV2:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
+        if _IS_HIP and self._is_multinode:
+            pull_block_caps: List[Optional[int]] = [None] * self.world_size
+            dist.all_gather_object(pull_block_caps, num_pull_blocks, group=self.group)
+            num_pull_blocks = min(
+                block_count
+                for block_count in pull_block_caps
+                if block_count is not None
+            )
         self.config = base_config.clip(
             max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
@@ -191,9 +216,10 @@ class CustomAllReduceV2:
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
         # node-local VMM remap) does not — force eager pull inside graphs.
-        is_multinode = not all(in_the_same_node_as(group, source_rank=0))
+        # Multi-node groups stage graph inputs through the workspace. Same-node
+        # gfx1250 registers graph inputs over HIP IPC and skips the copies.
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-        self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
+        self._is_graph_mode_supported = not tms_cudagraph and not self._is_multinode
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
@@ -201,20 +227,29 @@ class CustomAllReduceV2:
             dtype=torch.uint64,
             device=self.device,
         )
-        self._init_workspace()
-        self._ipc_manager = IPCManager()
-        self._vmm_graph_input_manager = VmmGraphInputManager(
-            obj=self,
-            group=self.group,
-            rank=self.rank,
-            world_size=self.world_size,
+        if not self._init_workspace():
+            return
+        self._ipc_manager = (
+            HIPGraphIPCManager()
+            if _IS_HIP and not self._is_multinode
+            else (None if _IS_HIP else IPCManager())
+        )
+        self._vmm_graph_input_manager = (
+            None
+            if _IS_HIP
+            else VmmGraphInputManager(
+                obj=self,
+                group=self.group,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
         )
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
         self._graph_mode_allowed = False
         self.disabled = False
 
-    def _init_workspace(self) -> None:
+    def _init_workspace(self) -> bool:
         """Slice one symmetric-memory allocation into every shared buffer.
 
         Layout per rank: ``[2 * world_size push slots | pull buffer | pull
@@ -222,6 +257,9 @@ class CustomAllReduceV2:
         rendezvous and a single multicast base to offset from. The push
         counter is rank-local, so it lives in a plain CUDA tensor.
         """
+        if _IS_HIP:
+            return self._init_hip_workspace()
+
         cfg = self.config
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
         push_bytes = push_num_slots * self.max_push_size
@@ -297,6 +335,99 @@ class CustomAllReduceV2:
                 self.pull_enabled,
             )
         dist.barrier(group=self.group)
+        return True
+
+    def _init_hip_workspace(self) -> bool:
+        """Build a host-local IPC or clique-wide fabric gfx1250 pull plane."""
+        assert self.pull_enabled, "gfx1250 CustomAllReduceV2 requires its pull plane"
+        cfg = self.config
+        pull_bytes = self.max_pull_size
+        sem_bytes = _SEMAPHORE_BYTES * cfg.num_pull_blocks
+        total_bytes = pull_bytes + sem_bytes
+
+        plane_class = HIPFabricPlane if self._is_multinode else HIPIPCPlane
+        plane_name = "HIP fabric" if self._is_multinode else "HIP IPC"
+        plane = None
+        local_handle = None
+        local_error = None
+        try:
+            plane = plane_class(total_bytes, self.rank, self.world_size)
+            local_handle = list(plane.get_handle())
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+        construction_errors: List[Optional[str]] = [None] * self.world_size
+        dist.all_gather_object(construction_errors, local_error, group=self.group)
+        if any(error is not None for error in construction_errors):
+            if plane is not None:
+                try:
+                    plane.destroy()
+                except Exception:
+                    pass
+            if self.rank == 0:
+                logger.warning(
+                    "%s plane construction failed; falling back to RCCL: %s",
+                    plane_name,
+                    construction_errors,
+                )
+            return False
+
+        assert plane is not None and local_handle is not None
+        handles: List[Optional[list]] = [None] * self.world_size
+        dist.all_gather_object(handles, local_handle, group=self.group)
+        assert all(handle is not None for handle in handles)
+        sizes: List[Optional[int]] = [None] * self.world_size
+        local_size = plane.get_nbytes() if self._is_multinode else total_bytes
+        dist.all_gather_object(sizes, local_size, group=self.group)
+        assert all(size is not None for size in sizes)
+        open_error = None
+        try:
+            if self._is_multinode:
+                plane.open_handles(
+                    [handle for handle in handles if handle is not None],
+                    [size for size in sizes if size is not None],
+                )
+            else:
+                plane.open_handles([handle for handle in handles if handle is not None])
+        except Exception as exc:
+            open_error = f"{type(exc).__name__}: {exc}"
+        open_errors: List[Optional[str]] = [None] * self.world_size
+        dist.all_gather_object(open_errors, open_error, group=self.group)
+        if any(error is not None for error in open_errors):
+            try:
+                plane.destroy()
+            except Exception:
+                pass
+            if self.rank == 0:
+                logger.warning(
+                    "%s peer mapping failed; falling back to RCCL: %s",
+                    plane_name,
+                    open_errors,
+                )
+            return False
+
+        self._hip_plane = plane
+        bases = list(plane.get_pointers())
+        semaphores = [base + pull_bytes for base in bases]
+
+        pull_plane = PullPlane(
+            self.rank,
+            self.world_size,
+            raw_workspaces=bases,
+            raw_semaphores=semaphores,
+            num_bytes=pull_bytes,
+            num_blocks=cfg.num_pull_blocks,
+        )
+        self.has_multicast = False
+        self.config = self.config._replace(num_mc_blocks=None)
+        self.obj = Communicator(pull=pull_plane)
+        if self.rank == 0:
+            logger.info(
+                "All Reduce config: %s pull plane = %.2f MB, multicast = false",
+                plane_name,
+                total_bytes / MB,
+            )
+        dist.barrier(group=self.group)
+        return True
 
     # ------------------------------------------------------------------
     # Algo selection
@@ -412,6 +543,9 @@ class CustomAllReduceV2:
     def _register_graph_inputs(self) -> None:
         if not self._graph_inputs:
             return
+        if _IS_HIP:
+            self._register_graph_inputs_ipc()
+            return
         first_ptr = self._graph_inputs[0][0]
         if is_vmm_pointer(first_ptr):
             # calls back into get_graph_capture_bases / register_peer_mapped_inputs
@@ -425,6 +559,9 @@ class CustomAllReduceV2:
         This is the fast path for cudaMalloc-backed allocations. Fails on
         VMM pointers (expandable_segments), which use the VMM path instead.
         """
+        assert self._ipc_manager is not None, (
+            "Graph-input IPC registration is unavailable on ROCm"
+        )
         ptrs = [ptr for ptr, _ in self._graph_inputs]
         handles = self._ipc_manager.batch_get_handles(ptrs)
         local = [(list(handle), int(offset)) for handle, offset in handles]
@@ -463,10 +600,16 @@ class CustomAllReduceV2:
 
     def close(self):
         if not self.disabled and hasattr(self, "obj"):
-            self._ipc_manager.destroy()
+            if self._ipc_manager is not None:
+                self._ipc_manager.destroy()
             dist.barrier(group=self.group)
             del self.obj  # drop the pointer holder before the workspace tensors
-        if hasattr(self, "_vmm_graph_input_manager"):
+            if hasattr(self, "_hip_plane"):
+                self._hip_plane.destroy()
+        if (
+            hasattr(self, "_vmm_graph_input_manager")
+            and self._vmm_graph_input_manager is not None
+        ):
             self._vmm_graph_input_manager.close()
 
     def __del__(self):
@@ -479,6 +622,11 @@ def _is_vmm_backed_allocator(device: torch.device) -> bool:
     return is_vmm_pointer(probe.data_ptr())
 
 
+def _is_gfx1250(device: torch.device) -> bool:
+    props = torch.cuda.get_device_properties(device)
+    return "gfx1250" in getattr(props, "gcnArchName", "")
+
+
 def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
@@ -486,7 +634,27 @@ def can_use_custom_all_reduce_v2(
     supported = get_supported_world_sizes()
     if dist.get_world_size(group=group) not in supported:
         return False
-    if not all(in_the_same_node_as(group, source_rank=0)):
+    same_node = all(in_the_same_node_as(group, source_rank=0))
+    if _IS_HIP:
+        if not _is_gfx1250(device):
+            return False
+        if same_node:
+            return True
+        rank = dist.get_rank(group=group)
+        device_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        local = probe_local_fabric_capability(device_index, rank=rank)
+        capabilities = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(capabilities, local, group=group)
+        fabric_supported, reasons = validate_fabric_clique(capabilities)
+        if not fabric_supported and rank == 0:
+            logger.warning(
+                "CustomAllReduceV2 fabric plane is unavailable; falling back to RCCL: %s",
+                reasons,
+            )
+        return fabric_supported
+    if not same_node:
         return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,

@@ -32,7 +32,7 @@ PushPlaneObj::PushPlaneObj(
   auto N = SymbolicSize{"slot_bytes"};
   auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
-  device_sym.set_options<kDLCUDA>();
+  device_sym.set_options<kDLGPU>();
   for (uint32_t i = 0; i < world_size; ++i) {
     TensorMatcher({2 * world_size, N})  //
         .with_dtype<uint8_t>()
@@ -61,7 +61,11 @@ PullPlaneObj::PullPlaneObj(
     std::vector<TensorView> workspaces,  // world_size * [num_bytes]
     std::vector<TensorView> semaphores,  // world_size * [num_blocks]
     intptr_t mc_workspace_ptr,
-    intptr_t mc_semaphore_ptr)
+    intptr_t mc_semaphore_ptr,
+    std::vector<intptr_t> raw_workspaces,
+    std::vector<intptr_t> raw_semaphores,
+    int64_t raw_num_bytes,
+    uint32_t raw_num_blocks)
     : BasePlane(rank, world_size),  //
       num_blocks(),
       num_bytes(),
@@ -71,12 +75,28 @@ PullPlaneObj::PullPlaneObj(
       mc_workspace() {
   CHECK_HOST(workspaces.size() == world_size) << "Bad pull workspace count";
   CHECK_HOST(semaphores.size() == world_size) << "Bad pull semaphore count";
+  const bool use_raw = !raw_workspaces.empty() || !raw_semaphores.empty();
+  if (use_raw) {
+    CHECK_HOST(raw_workspaces.size() == world_size) << "Bad raw pull workspace count";
+    CHECK_HOST(raw_semaphores.size() == world_size) << "Bad raw pull semaphore count";
+    CHECK_HOST(raw_num_bytes > 0 && raw_num_blocks > 0) << "Raw pull plane must provide sizes";
+    this->num_blocks = raw_num_blocks;
+    this->num_bytes = raw_num_bytes;
+    for (uint32_t i = 0; i < world_size; ++i) {
+      CHECK_HOST(raw_workspaces[i] != 0 && raw_semaphores[i] != 0) << "Null raw pull plane pointer";
+      this->workspaces[i] = reinterpret_cast<uint8_t*>(raw_workspaces[i]);
+      this->semaphores[i] = reinterpret_cast<Semaphore*>(raw_semaphores[i]);
+    }
+    this->mc_semaphore = nullptr;
+    this->mc_workspace = nullptr;
+    return;
+  }
   // Either half may be empty (a 0-element tensor); the halves a caller does
   // own still have to agree on size and device across ranks.
   auto N = SymbolicSize{"num_bytes"};
   auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
-  device_sym.set_options<kDLCUDA>();
+  device_sym.set_options<kDLGPU>();
   for (uint32_t i = 0; i < world_size; ++i) {
     TensorMatcher({N})  //
         .with_dtype<uint8_t>()
@@ -118,6 +138,7 @@ inline void register_communicator() {
   namespace dist = host::distributed;
   using TensorView = tvm::ffi::TensorView;
   using Tensors = std::vector<TensorView>;
+  using Pointers = std::vector<intptr_t>;
 
   refl::ObjectDef<dist::PushPlaneObj>()
       .def(refl::init<uint32_t, uint32_t, Tensors, TensorView, intptr_t>(), "__init__")
@@ -127,7 +148,9 @@ inline void register_communicator() {
       .def_ro("slot_bytes", &dist::PushPlaneObj::slot_bytes);
 
   refl::ObjectDef<dist::PullPlaneObj>()
-      .def(refl::init<uint32_t, uint32_t, Tensors, Tensors, intptr_t, intptr_t>(), "__init__")
+      .def(
+          refl::init<uint32_t, uint32_t, Tensors, Tensors, intptr_t, intptr_t, Pointers, Pointers, int64_t, uint32_t>(),
+          "__init__")
       .def_ro("rank", &dist::PullPlaneObj::rank)
       .def_ro("world_size", &dist::PullPlaneObj::world_size)
       .def_ro("num_blocks", &dist::PullPlaneObj::num_blocks)

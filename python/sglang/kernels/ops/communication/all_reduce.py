@@ -110,6 +110,10 @@ class PullPlane(tvm_ffi.Object):
         semaphores: List[torch.Tensor] | None = None,
         mc_workspace: int | None = None,
         mc_semaphore: int | None = None,
+        raw_workspaces: List[int] | None = None,
+        raw_semaphores: List[int] | None = None,
+        num_bytes: int = 0,
+        num_blocks: int = 0,
     ) -> None:
         """
         :param workspaces: per-rank ``[num_bytes]`` uint8 views of symmetric
@@ -119,6 +123,11 @@ class PullPlane(tvm_ffi.Object):
                            None when the caller never barriers on this plane.
         :param mc_workspace: multicast VA of the local workspace, or None.
         :param mc_semaphore: multicast VA of the local semaphores, or None.
+        :param raw_workspaces: peer workspace addresses for a non-Tensor
+                               storage plane. When set, ``raw_semaphores`` and
+                               the explicit sizes are also required.
+        :param raw_semaphores: peer semaphore addresses paired with
+                               ``raw_workspaces``.
         """
         if workspaces is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -132,7 +141,16 @@ class PullPlane(tvm_ffi.Object):
         mc_workspace = mc_workspace or 0
         mc_semaphore = mc_semaphore or 0
         self.__ffi_init__(
-            rank, world_size, workspaces, semaphores, mc_workspace, mc_semaphore
+            rank,
+            world_size,
+            workspaces,
+            semaphores,
+            mc_workspace,
+            mc_semaphore,
+            raw_workspaces or [],
+            raw_semaphores or [],
+            num_bytes,
+            num_blocks,
         )
 
 
@@ -195,6 +213,78 @@ class IPCManager(tvm_ffi.Object):
 
     if TYPE_CHECKING:
         # C++ interface
+        def destroy(self) -> None: ...
+        def batch_get_handles(self, ptrs: List[int]) -> List[IPC_HANDLE_PAIR]: ...
+        def batch_open_handles(self, handles: List[IPC_HANDLE_PAIR]) -> List[int]: ...
+
+    def __init__(self) -> None:
+        self.__ffi_init__()
+
+
+def _init_hip_ipc_plane() -> None:
+    module = load_jit(
+        "hip_ipc_plane",
+        cuda_files=["distributed/hip_ipc.cuh"],
+        cuda_wrappers=[("register_once", "register_hip_ipc_plane")],
+    )
+    module.register_once()
+
+
+@lazy_register_class("sgl.HIPIPCPlane", _init_hip_ipc_plane)
+class HIPIPCPlane(tvm_ffi.Object):
+    """Static uncached HIP allocation mapped into every local peer."""
+
+    if TYPE_CHECKING:
+
+        def get_handle(self) -> List[int]: ...
+        def open_handles(self, handles: List[List[int]]) -> None: ...
+        def get_pointers(self) -> List[int]: ...
+        def destroy(self) -> None: ...
+
+    def __init__(self, nbytes: int, rank: int, world_size: int) -> None:
+        self.__ffi_init__(nbytes, rank, world_size)
+
+
+def _init_hip_fabric_plane() -> None:
+    module = load_jit(
+        "hip_fabric_plane",
+        cuda_files=["distributed/hip_fabric.cuh"],
+        cuda_wrappers=[("register_once", "register_hip_fabric_plane")],
+    )
+    module.register_once()
+
+
+@lazy_register_class("sgl.HIPFabricPlane", _init_hip_fabric_plane)
+class HIPFabricPlane(tvm_ffi.Object):
+    """Uncached HIP VMM allocation mapped across one fabric clique."""
+
+    if TYPE_CHECKING:
+
+        def get_handle(self) -> List[int]: ...
+        def get_nbytes(self) -> int: ...
+        def open_handles(self, handles: List[List[int]], sizes: List[int]) -> None: ...
+        def get_pointers(self) -> List[int]: ...
+        def destroy(self) -> None: ...
+
+    def __init__(self, nbytes: int, rank: int, world_size: int) -> None:
+        self.__ffi_init__(nbytes, rank, world_size)
+
+
+def _init_hip_graph_ipc_manager() -> None:
+    module = load_jit(
+        "hip_graph_ipc",
+        cuda_files=["distributed/hip_graph_ipc.cuh"],
+        cuda_wrappers=[("register_once", "register_hip_graph_ipc_manager")],
+    )
+    module.register_once()
+
+
+@lazy_register_class("sgl.HIPGraphIPCManager", _init_hip_graph_ipc_manager)
+class HIPGraphIPCManager(tvm_ffi.Object):
+    """Same-host HIP-IPC registration for CUDA/HIP graph input pointers."""
+
+    if TYPE_CHECKING:
+
         def destroy(self) -> None: ...
         def batch_get_handles(self, ptrs: List[int]) -> List[IPC_HANDLE_PAIR]: ...
         def batch_open_handles(self, handles: List[IPC_HANDLE_PAIR]) -> List[int]: ...
