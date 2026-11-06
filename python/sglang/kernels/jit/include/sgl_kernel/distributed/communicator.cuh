@@ -67,6 +67,16 @@ struct alignas(128) Semaphore {
   SGL_DEVICE void put_release_multicast() {
     ptx::multimem_red_add_release(&m_flag, 1);
   }
+#if defined(USE_ROCM) && defined(__gfx1250__)
+  /// Owner-written flag for the gfx1250 barrier: peers only ever load it.
+  SGL_DEVICE void publish(uint32_t value) {
+    __hip_atomic_store(&m_flag, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  SGL_DEVICE void wait(uint32_t value) const {
+    while (static_cast<int32_t>(ptx::load_acquire_sys(&m_flag) - value) < 0)
+      ;
+  }
+#endif
 
  private:
   uint32_t m_flag;
@@ -155,18 +165,34 @@ struct LamportTrait {
   }
 };
 
+/// On gfx1250 every rank stores its own monotonic flag and loads its peers',
+/// so the barrier needs no remote atomics: those are not available across a
+/// UALink fabric. Each wave must have released its payload before `arrive`.
 template <uint32_t kWorldSize>
 struct Barrier {
  public:
   SGL_DEVICE Barrier(Semaphore* const* semaphores, uint32_t rank, uint32_t num_arrives)
       : m_counter(0), m_rank(rank), m_semaphores(semaphores) {
     const auto counter = semaphores[rank][blockIdx.x].counter_ptr();
+#if defined(USE_ROCM) && defined(__gfx1250__)
+    __shared__ uint32_t epoch;
+    if (threadIdx.x == 0) epoch = counter->inc(num_arrives);
+    __syncthreads();
+    m_counter = epoch;
+#else
     const auto signal = num_arrives * kWorldSize;
     m_counter = threadIdx.x == rank ? counter->inc(signal) : 0;
+#endif
   }
 
   template <bool kNeedFence>
   SGL_DEVICE void arrive(uint32_t n) const {
+#if defined(USE_ROCM) && defined(__gfx1250__)
+    const auto bx = blockIdx.x;
+    const auto flag = m_counter + n + 1;
+    if (threadIdx.x == 0) m_semaphores[m_rank][bx].publish(flag);
+    if (const auto peer = threadIdx.x; peer < kWorldSize) m_semaphores[peer][bx].wait(flag);
+#else
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
       const auto bx = blockIdx.x;
       const auto semaphore = &m_semaphores[tx][bx];
@@ -185,6 +211,7 @@ struct Barrier {
         }
       }
     }
+#endif
   }
 
   SGL_DEVICE void arrive_relaxed(uint32_t n) const {

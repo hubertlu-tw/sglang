@@ -385,10 +385,21 @@ def dispatch_custom_allreduce(
 
     On CUDA, the JIT-compiled v2 implementation is used by default.
     Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
-    Multi-node v2 is admitted only for a single NVLink clique (see
-    can_use_custom_all_reduce_v2); other cross-node groups fall back to NCCL.
+    Multi-node v2 is admitted only for a single NVLink clique on CUDA or a
+    single UALink fabric clique on gfx1250 (see can_use_custom_all_reduce_v2);
+    other cross-node groups fall back to NCCL/RCCL.
     """
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+    # CUDA keeps v2 on by default. On ROCm only gfx1250 takes it, and only when
+    # explicitly set: other ROCm GPUs keep AITER even under recipes that set it.
+    use_v2 = envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get() and (
+        _is_cuda
+        or (
+            _is_hip
+            and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set()
+            and "gfx1250" in torch.cuda.get_device_properties(device).gcnArchName
+        )
+    )
+    if use_v2:
         from .custom_all_reduce_v2 import (
             CustomAllReduceV2,
             can_use_custom_all_reduce_v2,

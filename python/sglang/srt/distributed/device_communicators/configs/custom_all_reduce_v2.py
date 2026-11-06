@@ -338,10 +338,28 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     return {world_size: default for world_size in range(2, 9)}
 
 
+# gfx1250 (MI455X), within one node or across one UALink fabric clique. Untuned.
+# Pull only: the Lamport push protocol needs peer-visible marker semantics
+# gfx1250 does not provide, so both push thresholds stay 0.
+@cache
+def _gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    default = AllReduceConfig(
+        graph=Heuristic(0, 1 * MB, 16 * MB),
+        eager=Heuristic(0, 1 * MB, 16 * MB),
+        num_push_blocks=num_sm,
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    return {world_size: default for world_size in range(2, 17)}
+
+
 @cache
 def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
-    num_sm = torch.cuda.get_device_properties().multi_processor_count
+    properties = torch.cuda.get_device_properties()
+    num_sm = properties.multi_processor_count
     if torch.version.hip:
+        if "gfx1250" in getattr(properties, "gcnArchName", ""):
+            return _gfx1250_configs(num_sm)
         # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
         return _rocm_configs(num_sm)
     cuda_major, cuda_minor = torch.cuda.get_device_capability()

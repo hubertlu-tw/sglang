@@ -73,6 +73,14 @@ TEST_ALGOS = [
     AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
+# gfx1250 runs the pull algorithms only (no Lamport marker semantics)
+_PULL_ONLY = (
+    torch.version.hip is not None
+    and torch.cuda.is_available()
+    and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+)
+if _PULL_ONLY:
+    TEST_ALGOS = [algo for algo in TEST_ALGOS if not algo.is_push()]
 USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
 TEST_LOOP = 16
@@ -196,6 +204,7 @@ def test_custom_all_reduce(
     _check_custom_all_reduce(size, dtype, algo, use_graph, _init_comm_once())
 
 
+@pytest.mark.skipif(_PULL_ONLY, reason="gfx1250 runs the pull algorithms only")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("nbytes", [32, 288 * 1024])
